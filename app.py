@@ -6,46 +6,29 @@ import io
 # --- CONFIGURAÇÃO INICIAL ---
 st.set_page_config(page_title="Gym Trade 🏋️‍♂️", layout="wide", page_icon="🏋️‍♂️")
 
-# ==============================================================================
-# ⚠️ COLOQUE SUA CHAVE AQUI ABAIXO
-# ==============================================================================
-# Busca a chave no cofre secreto do Streamlit Cloud
+# --- SEGURANÇA DA CHAVE (CLOUD vs LOCAL) ---
+# Tenta pegar a chave do Cofre do Streamlit. 
+# Se não achar (rodando local), avisa o usuário.
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 except:
-    # Fallback para rodar local no seu PC se quiser
-    GOOGLE_API_KEY = "AIzaSyCM1Xrw6zTKZ0nYwj_XOp8jTu3NdZkvbU0"
+    # Se quiser rodar no seu PC, troque a mensagem abaixo pela sua chave direta
+    GOOGLE_API_KEY = "AIzaSyCXvrCGYRZNDlNXLySGzXkAljvGgln0umE" 
 
 genai.configure(api_key=GOOGLE_API_KEY)
 
 # --- FUNÇÕES ---
 def obter_melhor_modelo():
-    """
-    Função inteligente que busca qual modelo está disponível na sua chave.
-    Tenta pegar o mais recente (1.5) e, se não der, pega o padrão (pro).
-    """
+    """Busca o melhor modelo disponível na chave (Flash ou Pro)"""
     try:
-        # Lista todos os modelos disponíveis para sua chave
-        modelos = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                modelos.append(m.name)
-        
-        # Tenta encontrar o Flash (mais rápido e barato)
+        modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         for m in modelos:
             if 'flash' in m and '1.5' in m: return m
-        
-        # Se não achar, tenta o Pro 1.5
         for m in modelos:
             if 'pro' in m and '1.5' in m: return m
-            
-        # Se não achar, pega qualquer um que tenha "gemini"
-        for m in modelos:
-            if 'gemini' in m: return m
-            
-        return 'gemini-pro' # Última tentativa
-    except Exception as e:
-        return 'gemini-1.5-flash' # Chute padrão se a listagem falhar
+        return 'gemini-1.5-flash'
+    except:
+        return 'gemini-1.5-flash'
 
 def limpar_valor_monetario(valor):
     if isinstance(valor, (int, float)): return valor
@@ -65,7 +48,7 @@ def carregar_dados_blindado(uploaded_file):
                 break
         
         if inicio_tabela == -1:
-            st.error("Erro: Cabeçalho 'Ativo' não encontrado.")
+            st.error("Erro: Cabeçalho 'Ativo' não encontrado no CSV.")
             return None
 
         csv_limpo = '\n'.join(linhas[inicio_tabela:])
@@ -76,15 +59,13 @@ def carregar_dados_blindado(uploaded_file):
         return None
 
 def analisar_com_gemini(resumo_texto):
-    if "SUA_CHAVE_AQUI" in GOOGLE_API_KEY:
-        return "⚠️ Configure sua API Key no código."
+    # Verifica se a chave foi carregada corretamente
+    if not GOOGLE_API_KEY or "SUA_CHAVE" in GOOGLE_API_KEY:
+        return "⚠️ Erro de Segurança: Chave API não encontrada nos Segredos do Streamlit."
     
-    # Busca o nome do modelo correto automaticamente
     nome_modelo = obter_melhor_modelo()
-    
     try:
         model = genai.GenerativeModel(nome_modelo)
-        
         prompt = f"""
         Atue como um Mentor de Day Trade experiente.
         Analise os dados de hoje:
@@ -95,15 +76,19 @@ def analisar_com_gemini(resumo_texto):
         2. Analise Risco x Retorno.
         3. Se fez mais de 15 trades, critique o overtrading.
         """
-        
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        return f"Erro na IA (Tentando usar {nome_modelo}): {e}"
+        return f"Erro na IA ({nome_modelo}): {e}"
 
 # --- FRONTEND ---
 st.title("🏋️‍♂️ Gym Trade")
 st.markdown("### *Treino difícil, trade fácil.*")
+
+# Verifica se a chave está configurada antes de começar
+if not GOOGLE_API_KEY or "SUA_CHAVE" in GOOGLE_API_KEY:
+    st.warning("⚠️ **Atenção:** A chave do Google não foi detectada.")
+    st.info("Vá em **Manage App > Settings > Secrets** e adicione: `GOOGLE_API_KEY = 'sua-chave'`")
 
 st.sidebar.header("Check-in")
 arquivo = st.sidebar.file_uploader("Relatório de Performance (.csv)", type=["csv"])
@@ -112,8 +97,8 @@ if arquivo:
     df = carregar_dados_blindado(arquivo)
     
     if df is not None:
-        # Tenta achar a coluna de resultado
-        cols = [c for c in df.columns if 'Res' in c and 'Op' in c]
+        # Busca colunas flexíveis (Res ou Resultado)
+        cols = [c for c in df.columns if ('Res' in c or 'Lucro' in c) and ('Op' in c or 'Liq' in c)]
         
         if cols:
             col_resultado = cols[0]
@@ -141,7 +126,7 @@ if arquivo:
 
             st.divider()
             if st.button("📢 Análise do Coach"):
-                with st.spinner('Conectando ao cérebro do Coach...'):
+                with st.spinner('Conectando ao Coach...'):
                     resumo = f"Financeiro: R$ {total_resultado}. Trades: {qtd_trades}. Acerto: {taxa_acerto:.1f}%."
                     msg = analisar_com_gemini(resumo)
                     if total_resultado >= 0: st.success(f"🤖 **Coach:** {msg}")
@@ -150,4 +135,4 @@ if arquivo:
             with st.expander("Ver Dados Brutos"):
                 st.dataframe(df)
         else:
-            st.error("Erro: Coluna de Resultado não encontrada.")
+            st.error("Erro: Coluna de Resultado não encontrada no arquivo.")

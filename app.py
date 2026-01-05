@@ -13,7 +13,7 @@ try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 except:
     # Se quiser rodar no seu PC, troque a mensagem abaixo pela sua chave direta
-    GOOGLE_API_KEY = "AIzaSyCXvrCGYRZNDlNXLySGzXkAljvGgln0umE" 
+    GOOGLE_API_KEY = "SUA_CHAVE_LOCAL_AQUI" 
 
 genai.configure(api_key=GOOGLE_API_KEY)
 

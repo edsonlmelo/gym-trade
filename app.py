@@ -18,18 +18,34 @@ if chave:
 else:
     st.error("⚠️ Configure a GOOGLE_API_KEY nos Secrets!")
 
-# --- FUNÇÕES ---
+# --- FUNÇÕES INTELIGENTES ---
+def obter_modelo_disponivel():
+    """Descobre qual modelo sua chave tem acesso para evitar erro 404"""
+    try:
+        modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        # Tenta achar o Flash (mais rápido)
+        for m in modelos:
+            if 'flash' in m: return m
+        # Tenta achar o Pro
+        for m in modelos:
+            if 'pro' in m: return m
+        # Padrão seguro
+        return 'gemini-1.5-flash'
+    except:
+        return 'gemini-1.5-flash'
+
 def extrair_dados_pdf(arquivo_pdf):
     """Extrai texto do PDF e usa IA para identificar os valores financeiros"""
     try:
-        # 1. Extrai texto bruto do PDF
         leitor = pypdf.PdfReader(arquivo_pdf)
         texto_completo = ""
         for pagina in leitor.pages:
             texto_completo += pagina.extract_text()
         
-        # 2. Usa o Gemini para estruturar os dados (JSON)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # Usa o modelo dinâmico
+        nome_modelo = obter_modelo_disponivel()
+        model = genai.GenerativeModel(nome_modelo)
+        
         prompt = f"""
         Analise o texto desta Nota de Corretagem de Day Trade e extraia EXATAMENTE os valores abaixo em formato JSON.
         Se não encontrar, retorne 0.0.
@@ -37,18 +53,17 @@ def extrair_dados_pdf(arquivo_pdf):
         Texto da Nota:
         {texto_completo}
         
-        Campos requeridos (retorne apenas os números float, ponto como decimal):
-        - "total_custos": (Soma de corretagem, emolumentos, taxas de registro, ISS, etc. TUDO que for custo operacional).
-        - "irrf": (Imposto de Renda Retido na Fonte / Dedo-duro. Geralmente 1% sobre o lucro).
+        Campos requeridos (retorne apenas números float, ponto como decimal):
+        - "total_custos": (Soma de corretagem, emolumentos, taxas registro, ISS. Tudo que é custo).
+        - "irrf": (Imposto de Renda Retido / Dedo-duro).
         - "resultado_liquido_nota": (O valor final creditado/debitado na conta).
-        - "data_pregao": (Data da operação no formato DD/MM/AAAA).
+        - "data_pregao": (Data formato DD/MM/AAAA).
         
-        Retorne APENAS o JSON.
+        Retorne APENAS o JSON. Sem markdown.
         """
         response = model.generate_content(prompt)
-        # Limpeza básica para garantir que venha só o JSON
-        texto_limpo = response.text.replace('```json', '').replace('```', '')
-        return eval(texto_limpo) # Converte string JSON para dicionário Python
+        texto_limpo = response.text.replace('```json', '').replace('```', '').strip()
+        return eval(texto_limpo)
         
     except Exception as e:
         return {"erro": str(e)}
@@ -71,7 +86,6 @@ def carregar_csv_blindado(uploaded_file):
 # --- INTERFACE ---
 st.title("📈 Gym Trade Pro")
 
-# Criamos Abas para organizar
 aba_treino, aba_contador = st.tabs(["🏋️‍♂️ Treino Diário (CSV)", "💰 Contabilidade & DARF (PDF)"])
 
 # --- ABA 1: O TREINO (CSV) ---
@@ -82,7 +96,9 @@ with aba_treino:
     if arquivo_csv:
         df = carregar_csv_blindado(arquivo_csv)
         if df is not None:
-            col_res = next((c for c in df.columns if 'Res' in c and 'Op' in c), None)
+            # Tenta encontrar colunas de resultado
+            col_res = next((c for c in df.columns if ('Res' in c or 'Lucro' in c) and ('Op' in c or 'Liq' in c)), None)
+            
             if col_res:
                 df['Valor'] = df[col_res].apply(limpar_valor_monetario)
                 res = df['Valor'].sum()
@@ -96,72 +112,66 @@ with aba_treino:
                 
                 # Feedback IA Rápido
                 if st.button("Coach, analise meu dia"):
-                    model = genai.GenerativeModel('gemini-1.5-flash')
-                    msg = model.generate_content(f"Trader fez R$ {res}, {trades} trades. Seja breve e duro sobre disciplina.").text
-                    st.info(msg)
+                    with st.spinner("Conectando ao Coach..."):
+                        nome_modelo = obter_modelo_disponivel()
+                        model = genai.GenerativeModel(nome_modelo)
+                        try:
+                            msg = model.generate_content(f"Trader fez R$ {res}, {trades} trades. Seja breve e duro sobre disciplina.").text
+                            st.info(msg)
+                        except Exception as e:
+                            st.error(f"Erro na IA: {e}")
                     
                 st.dataframe(df)
+            else:
+                st.warning("Não encontrei a coluna de Resultado no CSV. Verifique o arquivo.")
 
 # --- ABA 2: O CONTADOR (PDF) ---
 with aba_contador:
     st.header("Fechamento Fiscal")
-    st.markdown("Suba sua **Nota de Corretagem (PDF)** para calcular custos reais e IR.")
+    st.markdown("Suba sua **Nota de Corretagem (PDF)**.")
     
     col_input1, col_input2 = st.columns(2)
     arquivo_pdf = col_input1.file_uploader("Nota de Corretagem (.pdf)", type=["pdf"], key="pdf_uploader")
     prejuizo_anterior = col_input2.number_input("Prejuízo acumulado (Meses anteriores)", min_value=0.0, value=0.0, step=10.0)
     
     if arquivo_pdf:
-        with st.spinner("O Contador IA está lendo a nota..."):
+        with st.spinner("Lendo nota..."):
             dados = extrair_dados_pdf(arquivo_pdf)
         
         if "erro" not in dados:
-            st.success(f"Nota lida com sucesso! Data: {dados.get('data_pregao', 'N/A')}")
+            st.success(f"Nota de {dados.get('data_pregao', 'Data não lida')}")
             
-            # --- CÁLCULOS FISCAIS ---
             resultado_nota = float(dados.get('resultado_liquido_nota', 0))
             custos_totais = float(dados.get('total_custos', 0))
             irrf = float(dados.get('irrf', 0))
             
-            # Reconstruindo o Bruto aproximado (Liquido da nota + custos)
-            # Nota: O cálculo exato depende se o resultado nota já desconta IRRF. 
-            # Vamos assumir que Resultado Nota = (Bruto - Custos - IRRF)
-            lucro_bruto_calculado = resultado_nota + custos_totais + irrf
+            # Cálculo Reverso
+            lucro_bruto_est = resultado_nota + custos_totais + irrf
+            lucro_liq_op = lucro_bruto_est - custos_totais
+            base_calculo = lucro_liq_op - prejuizo_anterior
             
-            # Base de Cálculo Real
-            lucro_liquido_operacional = lucro_bruto_calculado - custos_totais
-            base_calculo = lucro_liquido_operacional - prejuizo_anterior
-            
-            # Painel Financeiro
             st.divider()
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Resultado Nota (Líquido)", f"R$ {resultado_nota:,.2f}")
-            c2.metric("Custos Totais", f"R$ {custos_totais:,.2f}", delta_color="inverse")
-            c3.metric("IRRF (Já pago)", f"R$ {irrf:,.2f}")
-            c4.metric("Prejuízo Compensado", f"- R$ {prejuizo_anterior:,.2f}")
+            c1.metric("Resultado Nota", f"R$ {resultado_nota:,.2f}")
+            c2.metric("Custos", f"R$ {custos_totais:,.2f}", delta_color="inverse")
+            c3.metric("IRRF", f"R$ {irrf:,.2f}")
+            c4.metric("Prejuízo Usado", f"- R$ {prejuizo_anterior:,.2f}")
             
             st.divider()
             
-            # --- SITUAÇÃO FINAL ---
             if base_calculo > 0:
-                imposto_devido = base_calculo * 0.20 # 20% Day Trade
-                valor_darf = imposto_devido - irrf
-                
-                if valor_darf > 10: # DARF menor que 10 reais não se paga
-                    st.success(f"### 📄 GERAR DARF: R$ {valor_darf:,.2f}")
-                    st.write(f"**Memória de Cálculo:**")
-                    st.write(f"(Lucro Líquido R$ {lucro_liquido_operacional:.2f} - Prejuízo R$ {prejuizo_anterior:.2f}) x 20% = Imposto R$ {imposto_devido:.2f}")
-                    st.write(f"Imposto R$ {imposto_devido:.2f} - IRRF R$ {irrf:.2f} = **R$ {valor_darf:.2f}**")
-                    st.warning("⚠️ Vencimento: Último dia útil do mês seguinte.")
-                elif valor_darf > 0:
-                    st.info(f"### Valor acumulado: R$ {valor_darf:,.2f}")
-                    st.write("DARF menor que R$ 10,00 não é paga agora. Acumule para o próximo mês.")
+                imposto = base_calculo * 0.20
+                darf = imposto - irrf
+                if darf > 10:
+                    st.success(f"### 📄 GERAR DARF: R$ {darf:,.2f}")
+                    st.write("Vencimento: Último dia útil do mês seguinte.")
+                elif darf > 0:
+                    st.info(f"### Acumular: R$ {darf:,.2f}")
+                    st.caption("DARF menor que R$ 10,00 não se paga. Acumule.")
                 else:
-                    st.success("### Isento: O IRRF cobriu o imposto devido.")
+                    st.success("### Isento (IRRF cobriu o imposto)")
             else:
                 novo_prejuizo = abs(base_calculo)
                 st.error(f"### 📉 Prejuízo a Declarar: R$ {novo_prejuizo:,.2f}")
-                st.write("Anote este valor! Você deve usá-lo no campo 'Prejuízo Acumulado' no próximo mês para abater lucros futuros.")
-                
         else:
-            st.error(f"Não consegui ler a nota. Erro: {dados['erro']}")
+            st.error(f"Erro ao ler nota: {dados['erro']}")

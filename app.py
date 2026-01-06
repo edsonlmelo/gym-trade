@@ -9,90 +9,76 @@ import re
 # Configuração da Página
 st.set_page_config(page_title="Gym Trade Pro", layout="wide", page_icon="📈")
 
-# --- AUTENTICAÇÃO ---
+# --- AUTENTICAÇÃO E SEGURANÇA ---
 try:
     chave = st.secrets["GOOGLE_API_KEY"]
 except:
     chave = ""
 
+# Configura a chave se ela existir
 if chave:
     genai.configure(api_key=chave)
-else:
-    st.error("⚠️ Configure a GOOGLE_API_KEY nos Secrets!")
 
-# --- FUNÇÕES INTELIGENTES ---
-def obter_modelo_disponivel():
-    """Tenta usar o Flash (rápido), se não der, usa o Pro"""
-    try:
-        modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        for m in modelos:
-            if 'flash' in m: return m
-        return 'gemini-1.5-flash'
-    except:
-        return 'gemini-1.5-flash'
+# --- FUNÇÕES ---
 
 def limpar_json(texto):
-    """Remove caracteres estranhos que a IA coloca antes de converter"""
+    """
+    Função cirúrgica para extrair JSON de respostas da IA.
+    Usa Expressão Regular para achar o bloco { ... } ignorando textos extras.
+    """
     try:
-        # Encontra o primeiro '{' e o último '}'
+        # Procura pelo primeiro '{' e último '}'
         padrao = r'\{.*\}'
         match = re.search(padrao, texto, re.DOTALL)
         if match:
             json_str = match.group(0)
             return json.loads(json_str)
         else:
-            return {"erro": "A IA não retornou um JSON válido."}
+            return {"erro": "A IA respondeu, mas não gerou o formato JSON correto."}
     except Exception as e:
-        return {"erro": f"Erro ao processar JSON: {str(e)}"}
+        return {"erro": f"Erro técnico ao processar resposta: {str(e)}"}
 
 def extrair_dados_pdf(arquivo_pdf):
-    """Lê o PDF e pede para a IA estruturar"""
+    """Lê o PDF e extrai dados financeiros"""
+    if not chave:
+        return {"erro": "Chave de API não configurada ou inválida."}
+
     try:
         leitor = pypdf.PdfReader(arquivo_pdf)
-        
-        # Verifica se tem senha (criptografado)
-        if leitor.is_encrypted:
-            return {"erro": "O PDF tem senha. Desbloqueie o arquivo antes de enviar (Imprimir como PDF > Salvar)."}
-            
         texto_completo = ""
         for pagina in leitor.pages:
-            texto_extraido = pagina.extract_text()
-            if texto_extraido:
-                texto_completo += texto_extraido + "\n"
+            texto_completo += pagina.extract_text() + "\n"
         
-        # Verifica se conseguiu ler algo
-        if not texto_completo.strip():
-            return {"erro": "O PDF parece vazio ou é uma imagem escaneada. O sistema precisa de PDFs com texto selecionável.", "debug": "Sem texto"}
-
-        # Chama a IA
-        nome_modelo = obter_modelo_disponivel()
-        model = genai.GenerativeModel(nome_modelo)
+        # Modelo mais rápido e barato (Gratuito)
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
         prompt = f"""
-        Aja como um contador experiente em B3. Analise o texto desta Nota de Corretagem:
+        Você é um auditor contábil. Analise o texto desta Nota de Corretagem (padrão Sinacor/CM Capital).
         
-        --- INÍCIO DA NOTA ---
-        {texto_completo[:10000]} 
-        --- FIM DA NOTA ---
+        TEXTO DA NOTA:
+        ---
+        {texto_completo[:15000]}
+        ---
         
-        Extraia os valores e retorne APENAS um JSON (sem crases, sem markdown) com estas chaves:
+        Extraia os seguintes valores e retorne APENAS um objeto JSON.
+        Se o valor for negativo na nota (ex: "D"), retorne negativo no JSON.
         
-        {{
-            "total_custos": (Soma de: Taxa Liquidação + Taxa Registro + Emolumentos + Corretagem + ISS + Outros Custos. Retorne float. Ex: 15.50),
-            "irrf": (Imposto de Renda Retido na Fonte, o 'dedo-duro'. Retorne float),
-            "resultado_liquido_nota": (O valor final da nota, positivo ou negativo. Retorne float),
-            "data_pregao": "DD/MM/AAAA"
-        }}
+        Campos do JSON:
+        1. "total_custos": Soma de TODAS as taxas operacionais (Taxa de liquidação + Taxa de Registro + Emolumentos + Corretagem + ISS/PIS/COFINS + Outras taxas). *Ignore o valor financeiro das operações, quero apenas os custos*.
+        2. "irrf": Valor do I.R.R.F. s/ operações (Dedo-duro). Se não tiver, 0.0.
+        3. "resultado_liquido_nota": O valor final "Líquido para [Data]" que aparece no resumo financeiro.
+        4. "data_pregao": A data do pregão no formato DD/MM/AAAA.
+        
+        Responda APENAS o JSON.
         """
         
         response = model.generate_content(prompt)
-        dados = limpar_json(response.text)
-        
-        # Adiciona o texto original para debug se precisar
-        dados['debug_texto'] = texto_completo[:500] 
-        return dados
+        return limpar_json(response.text)
         
     except Exception as e:
+        # Se o erro for de permissão, avisa claramente
+        if "403" in str(e) or "PermissionDenied" in str(e):
+             return {"erro": "ERRO DE PERMISSÃO: Sua API Key foi bloqueada ou é inválida. Gere uma nova no Google AI Studio."}
         return {"erro": str(e)}
 
 def limpar_valor_monetario(valor):
@@ -113,10 +99,16 @@ def carregar_csv_blindado(uploaded_file):
 # --- INTERFACE ---
 st.title("📈 Gym Trade Pro")
 
+if not chave:
+    st.error("🚨 **PARE TUDO:** A Chave de API não foi encontrada.")
+    st.info("Vá em **Manage App > Settings > Secrets** e adicione: `GOOGLE_API_KEY = 'sua-chave-nova'`")
+    st.stop() # Para a execução aqui se não tiver chave
+
 aba_treino, aba_contador = st.tabs(["🏋️‍♂️ Treino (CSV)", "💰 Contador (PDF)"])
 
 # --- ABA 1 ---
 with aba_treino:
+    st.caption("Importe o relatório de performance do Profit/Tryd")
     arquivo_csv = st.file_uploader("Relatório de Performance (.csv)", type=["csv"], key="csv")
     if arquivo_csv:
         df = carregar_csv_blindado(arquivo_csv)
@@ -134,29 +126,33 @@ with aba_treino:
                 c3.metric("Acerto", f"{acerto:.1f}%")
                 
                 if st.button("Coach, analise"):
-                    with st.spinner("Analisando..."):
-                        nome = obter_modelo_disponivel()
-                        msg = genai.GenerativeModel(nome).generate_content(f"Trader: R$ {res}, {trades} trades. Feedback curto.").text
-                        st.info(msg)
+                    try:
+                        model = genai.GenerativeModel('gemini-1.5-flash')
+                        msg = model.generate_content(f"Trader fez R$ {res}, {trades} trades. Feedback curto e grosso.").text
+                        st.info(f"🤖 **Coach:** {msg}")
+                    except Exception as e:
+                        if "PermissionDenied" in str(e):
+                            st.error("❌ Erro de Permissão na API Key. Gere uma nova chave.")
+                        else:
+                            st.error(f"Erro: {e}")
+                
                 st.dataframe(df)
 
 # --- ABA 2 ---
 with aba_contador:
-    st.header("Leitor de Nota de Corretagem")
-    st.info("💡 Dica: O PDF não pode ter senha. Se tiver, use 'Imprimir como PDF' para remover a senha antes de subir.")
+    st.header("Leitor de Nota (CM Capital / Sinacor)")
+    st.caption("Suporta notas em PDF geradas pelo Home Broker.")
     
     c1, c2 = st.columns(2)
     pdf = c1.file_uploader("Upload da Nota (.pdf)", type=["pdf"])
-    prejuizo = c2.number_input("Prejuízo Anterior", value=0.0, step=10.0)
+    prejuizo = c2.number_input("Prejuízo Anterior a compensar", value=0.0, step=10.0)
     
     if pdf:
-        with st.spinner("Lendo documento..."):
+        with st.spinner("Auditando nota..."):
             dados = extrair_dados_pdf(pdf)
         
         if "erro" in dados:
-            st.error(f"❌ Erro: {dados['erro']}")
-            if "debug" in dados:
-                st.warning("O sistema leu o arquivo mas não encontrou texto. É uma imagem?")
+            st.error(f"❌ Falha na leitura: {dados['erro']}")
         else:
             # Sucesso
             res_nota = float(dados.get('resultado_liquido_nota', 0))
@@ -164,32 +160,49 @@ with aba_contador:
             irrf = float(dados.get('irrf', 0))
             data = dados.get('data_pregao', 'N/A')
             
-            st.success(f"Nota processada! Data: {data}")
+            st.success(f"✅ Nota processada com sucesso! Pregão: {data}")
             
             col1, col2, col3 = st.columns(3)
-            col1.metric("Líquido da Nota", f"R$ {res_nota:,.2f}")
-            col2.metric("Custos Totais", f"R$ {custos:,.2f}")
-            col3.metric("IRRF (Dedo-Duro)", f"R$ {irrf:,.2f}")
+            col1.metric("Líquido da Nota", f"R$ {res_nota:,.2f}", help="Valor que efetivamente entrou/saiu da conta")
+            col2.metric("Custos Totais", f"R$ {custos:,.2f}", delta_color="inverse", help="Corretagem + Taxas B3 + Impostos")
+            col3.metric("IRRF (Dedo-Duro)", f"R$ {irrf:,.2f}", help="Já retido na fonte")
             
-            # Cálculo DARF
-            bruto_est = res_nota + custos + irrf
-            liq_op = bruto_est - custos
-            base = liq_op - prejuizo
+            # Cálculo Reverso para chegar no Bruto Operacional
+            # Líquido Nota = (Bruto - Custos - IRRF)
+            # Logo: Bruto = Líquido Nota + Custos + IRRF
+            bruto_calculado = res_nota + custos + irrf
+            
+            # Base de Cálculo para DARF
+            # Lucro Líquido Operacional (sem IRRF) = Bruto - Custos
+            lucro_liquido_op = bruto_calculado - custos 
+            base_calculo = lucro_liquido_op - prejuizo
             
             st.divider()
-            st.subheader("🧮 Fechamento do Mês")
+            st.subheader("🧮 Fechamento Fiscal")
             
-            if base > 0:
-                imposto = base * 0.20
+            if base_calculo > 0:
+                imposto = base_calculo * 0.20
                 pagar = imposto - irrf
-                if pagar > 10:
-                    st.success(f"### DARF A PAGAR: R$ {pagar:,.2f}")
-                    st.json({"Lucro Op": liq_op, "Prejuízo Usado": prejuizo, "Imposto 20%": imposto, "IRRF Abatido": irrf})
+                
+                # Regra dos 10 reais
+                if pagar >= 10:
+                    st.success(f"### 📄 DARF A PAGAR: R$ {pagar:,.2f}")
+                    st.json({
+                        "1. Lucro Líquido Operacional": lucro_liquido_op,
+                        "2. (-) Prejuízo Anterior": prejuizo,
+                        "3. (=) Base de Cálculo": base_calculo,
+                        "4. (x) Alíquota 20%": imposto,
+                        "5. (-) IRRF já pago": irrf,
+                        "6. (=) Valor da DARF": pagar
+                    })
+                    st.warning("Vencimento: Último dia útil do mês seguinte ao da operação.")
+                elif pagar > 0:
+                    st.info(f"### Acumular: R$ {pagar:,.2f}")
+                    st.caption("DARF menor que R$ 10,00 não se paga. Guarde esse valor para somar no mês que vem.")
                 else:
-                    st.info(f"Valor a pagar (R$ {pagar:.2f}) é menor que R$ 10. Acumule para o próximo mês.")
+                    st.success("### Isento (Saldo Zero)")
+                    st.caption("O IRRF retido foi suficiente para cobrir o imposto devido.")
             else:
-                st.error(f"### Prejuízo a Acumular: R$ {abs(base):,.2f}")
-                st.caption("Você não paga nada e usa esse valor para abater lucros futuros.")
-            
-            with st.expander("Ver texto lido (Debug)"):
-                st.text(dados.get('debug_texto', ''))
+                novo_prejuizo = abs(base_calculo)
+                st.error(f"### 📉 Prejuízo a Acumular: R$ {novo_prejuizo:,.2f}")
+                st.markdown(f"**Importante:** Anote este valor de **R$ {novo_prejuizo:,.2f}**. No mês que vem, digite ele no campo 'Prejuízo Anterior' para não pagar imposto indevido.")

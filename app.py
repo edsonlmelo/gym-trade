@@ -2,33 +2,56 @@ import streamlit as st
 import pandas as pd
 import google.generativeai as genai
 import io
+import pypdf
 
-# --- CONFIGURAÇÃO INICIAL ---
-st.set_page_config(page_title="Gym Trade 🏋️‍♂️", layout="wide", page_icon="🏋️‍♂️")
+# Configuração da Página
+st.set_page_config(page_title="Gym Trade Pro", layout="wide", page_icon="📈")
 
-# --- SEGURANÇA DA CHAVE (CLOUD vs LOCAL) ---
-# Tenta pegar a chave do Cofre do Streamlit. 
-# Se não achar (rodando local), avisa o usuário.
+# --- AUTENTICAÇÃO ---
 try:
-    GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
+    chave = st.secrets["GOOGLE_API_KEY"]
 except:
-    # Se quiser rodar no seu PC, troque a mensagem abaixo pela sua chave direta
-    GOOGLE_API_KEY = "SUA_CHAVE_LOCAL_AQUI" 
+    chave = ""
 
-genai.configure(api_key=GOOGLE_API_KEY)
+if chave:
+    genai.configure(api_key=chave)
+else:
+    st.error("⚠️ Configure a GOOGLE_API_KEY nos Secrets!")
 
 # --- FUNÇÕES ---
-def obter_melhor_modelo():
-    """Busca o melhor modelo disponível na chave (Flash ou Pro)"""
+def extrair_dados_pdf(arquivo_pdf):
+    """Extrai texto do PDF e usa IA para identificar os valores financeiros"""
     try:
-        modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        for m in modelos:
-            if 'flash' in m and '1.5' in m: return m
-        for m in modelos:
-            if 'pro' in m and '1.5' in m: return m
-        return 'gemini-1.5-flash'
-    except:
-        return 'gemini-1.5-flash'
+        # 1. Extrai texto bruto do PDF
+        leitor = pypdf.PdfReader(arquivo_pdf)
+        texto_completo = ""
+        for pagina in leitor.pages:
+            texto_completo += pagina.extract_text()
+        
+        # 2. Usa o Gemini para estruturar os dados (JSON)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        prompt = f"""
+        Analise o texto desta Nota de Corretagem de Day Trade e extraia EXATAMENTE os valores abaixo em formato JSON.
+        Se não encontrar, retorne 0.0.
+        
+        Texto da Nota:
+        {texto_completo}
+        
+        Campos requeridos (retorne apenas os números float, ponto como decimal):
+        - "total_custos": (Soma de corretagem, emolumentos, taxas de registro, ISS, etc. TUDO que for custo operacional).
+        - "irrf": (Imposto de Renda Retido na Fonte / Dedo-duro. Geralmente 1% sobre o lucro).
+        - "resultado_liquido_nota": (O valor final creditado/debitado na conta).
+        - "data_pregao": (Data da operação no formato DD/MM/AAAA).
+        
+        Retorne APENAS o JSON.
+        """
+        response = model.generate_content(prompt)
+        # Limpeza básica para garantir que venha só o JSON
+        texto_limpo = response.text.replace('```json', '').replace('```', '')
+        return eval(texto_limpo) # Converte string JSON para dicionário Python
+        
+    except Exception as e:
+        return {"erro": str(e)}
 
 def limpar_valor_monetario(valor):
     if isinstance(valor, (int, float)): return valor
@@ -37,102 +60,108 @@ def limpar_valor_monetario(valor):
     try: return float(valor)
     except: return 0.0
 
-def carregar_dados_blindado(uploaded_file):
+def carregar_csv_blindado(uploaded_file):
     try:
         string_data = uploaded_file.getvalue().decode('latin1')
         linhas = string_data.split('\n')
-        inicio_tabela = -1
-        for i, linha in enumerate(linhas):
-            if "Ativo" in linha and ";" in linha:
-                inicio_tabela = i
-                break
-        
-        if inicio_tabela == -1:
-            st.error("Erro: Cabeçalho 'Ativo' não encontrado no CSV.")
-            return None
+        inicio = next((i for i, l in enumerate(linhas) if "Ativo" in l and ";" in l), 0)
+        return pd.read_csv(io.StringIO('\n'.join(linhas[inicio:])), sep=';', encoding='latin1')
+    except: return None
 
-        csv_limpo = '\n'.join(linhas[inicio_tabela:])
-        df = pd.read_csv(io.StringIO(csv_limpo), sep=';', encoding='latin1')
-        return df
-    except Exception as e:
-        st.error(f"Erro ao processar: {e}")
-        return None
+# --- INTERFACE ---
+st.title("📈 Gym Trade Pro")
 
-def analisar_com_gemini(resumo_texto):
-    # Verifica se a chave foi carregada corretamente
-    if not GOOGLE_API_KEY or "SUA_CHAVE" in GOOGLE_API_KEY:
-        return "⚠️ Erro de Segurança: Chave API não encontrada nos Segredos do Streamlit."
+# Criamos Abas para organizar
+aba_treino, aba_contador = st.tabs(["🏋️‍♂️ Treino Diário (CSV)", "💰 Contabilidade & DARF (PDF)"])
+
+# --- ABA 1: O TREINO (CSV) ---
+with aba_treino:
+    st.header("Análise Técnica")
+    arquivo_csv = st.file_uploader("Relatório de Performance (.csv)", type=["csv"], key="csv_uploader")
     
-    nome_modelo = obter_melhor_modelo()
-    try:
-        model = genai.GenerativeModel(nome_modelo)
-        prompt = f"""
-        Atue como um Mentor de Day Trade experiente.
-        Analise os dados de hoje:
-        {resumo_texto}
-        
-        Regras:
-        1. Feedback curto (máximo 3 linhas).
-        2. Analise Risco x Retorno.
-        3. Se fez mais de 15 trades, critique o overtrading.
-        """
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"Erro na IA ({nome_modelo}): {e}"
-
-# --- FRONTEND ---
-st.title("🏋️‍♂️ Gym Trade")
-st.markdown("### *Treino difícil, trade fácil.*")
-
-# Verifica se a chave está configurada antes de começar
-if not GOOGLE_API_KEY or "SUA_CHAVE" in GOOGLE_API_KEY:
-    st.warning("⚠️ **Atenção:** A chave do Google não foi detectada.")
-    st.info("Vá em **Manage App > Settings > Secrets** e adicione: `GOOGLE_API_KEY = 'sua-chave'`")
-
-st.sidebar.header("Check-in")
-arquivo = st.sidebar.file_uploader("Relatório de Performance (.csv)", type=["csv"])
-
-if arquivo:
-    df = carregar_dados_blindado(arquivo)
-    
-    if df is not None:
-        # Busca colunas flexíveis (Res ou Resultado)
-        cols = [c for c in df.columns if ('Res' in c or 'Lucro' in c) and ('Op' in c or 'Liq' in c)]
-        
-        if cols:
-            col_resultado = cols[0]
-            df['Resultado_Limpo'] = df[col_resultado].apply(limpar_valor_monetario)
-            
-            total_resultado = df['Resultado_Limpo'].sum()
-            qtd_trades = len(df)
-            trades_win = df[df['Resultado_Limpo'] > 0]
-            taxa_acerto = (len(trades_win) / qtd_trades) * 100 if qtd_trades > 0 else 0
-            
-            cor = "normal" if total_resultado >= 0 else "off"
-
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Resultado", f"R$ {total_resultado:,.2f}", delta_color=cor)
-            col2.metric("Trades", qtd_trades)
-            col3.metric("Acerto", f"{taxa_acerto:.1f}%")
-            
-            pts = 0
-            if total_resultado > 0: pts += 10
-            if qtd_trades <= 10: pts += 10
-            else: pts -= 5
-            if taxa_acerto >= 60: pts += 10
-            
-            col4.metric("Score", f"{pts} pts")
-
-            st.divider()
-            if st.button("📢 Análise do Coach"):
-                with st.spinner('Conectando ao Coach...'):
-                    resumo = f"Financeiro: R$ {total_resultado}. Trades: {qtd_trades}. Acerto: {taxa_acerto:.1f}%."
-                    msg = analisar_com_gemini(resumo)
-                    if total_resultado >= 0: st.success(f"🤖 **Coach:** {msg}")
-                    else: st.error(f"🤖 **Coach:** {msg}")
-            
-            with st.expander("Ver Dados Brutos"):
+    if arquivo_csv:
+        df = carregar_csv_blindado(arquivo_csv)
+        if df is not None:
+            col_res = next((c for c in df.columns if 'Res' in c and 'Op' in c), None)
+            if col_res:
+                df['Valor'] = df[col_res].apply(limpar_valor_monetario)
+                res = df['Valor'].sum()
+                trades = len(df)
+                acerto = (len(df[df['Valor']>0])/trades)*100 if trades > 0 else 0
+                
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Resultado Bruto", f"R$ {res:,.2f}")
+                c2.metric("Trades", trades)
+                c3.metric("Acerto", f"{acerto:.1f}%")
+                
+                # Feedback IA Rápido
+                if st.button("Coach, analise meu dia"):
+                    model = genai.GenerativeModel('gemini-1.5-flash')
+                    msg = model.generate_content(f"Trader fez R$ {res}, {trades} trades. Seja breve e duro sobre disciplina.").text
+                    st.info(msg)
+                    
                 st.dataframe(df)
+
+# --- ABA 2: O CONTADOR (PDF) ---
+with aba_contador:
+    st.header("Fechamento Fiscal")
+    st.markdown("Suba sua **Nota de Corretagem (PDF)** para calcular custos reais e IR.")
+    
+    col_input1, col_input2 = st.columns(2)
+    arquivo_pdf = col_input1.file_uploader("Nota de Corretagem (.pdf)", type=["pdf"], key="pdf_uploader")
+    prejuizo_anterior = col_input2.number_input("Prejuízo acumulado (Meses anteriores)", min_value=0.0, value=0.0, step=10.0)
+    
+    if arquivo_pdf:
+        with st.spinner("O Contador IA está lendo a nota..."):
+            dados = extrair_dados_pdf(arquivo_pdf)
+        
+        if "erro" not in dados:
+            st.success(f"Nota lida com sucesso! Data: {dados.get('data_pregao', 'N/A')}")
+            
+            # --- CÁLCULOS FISCAIS ---
+            resultado_nota = float(dados.get('resultado_liquido_nota', 0))
+            custos_totais = float(dados.get('total_custos', 0))
+            irrf = float(dados.get('irrf', 0))
+            
+            # Reconstruindo o Bruto aproximado (Liquido da nota + custos)
+            # Nota: O cálculo exato depende se o resultado nota já desconta IRRF. 
+            # Vamos assumir que Resultado Nota = (Bruto - Custos - IRRF)
+            lucro_bruto_calculado = resultado_nota + custos_totais + irrf
+            
+            # Base de Cálculo Real
+            lucro_liquido_operacional = lucro_bruto_calculado - custos_totais
+            base_calculo = lucro_liquido_operacional - prejuizo_anterior
+            
+            # Painel Financeiro
+            st.divider()
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Resultado Nota (Líquido)", f"R$ {resultado_nota:,.2f}")
+            c2.metric("Custos Totais", f"R$ {custos_totais:,.2f}", delta_color="inverse")
+            c3.metric("IRRF (Já pago)", f"R$ {irrf:,.2f}")
+            c4.metric("Prejuízo Compensado", f"- R$ {prejuizo_anterior:,.2f}")
+            
+            st.divider()
+            
+            # --- SITUAÇÃO FINAL ---
+            if base_calculo > 0:
+                imposto_devido = base_calculo * 0.20 # 20% Day Trade
+                valor_darf = imposto_devido - irrf
+                
+                if valor_darf > 10: # DARF menor que 10 reais não se paga
+                    st.success(f"### 📄 GERAR DARF: R$ {valor_darf:,.2f}")
+                    st.write(f"**Memória de Cálculo:**")
+                    st.write(f"(Lucro Líquido R$ {lucro_liquido_operacional:.2f} - Prejuízo R$ {prejuizo_anterior:.2f}) x 20% = Imposto R$ {imposto_devido:.2f}")
+                    st.write(f"Imposto R$ {imposto_devido:.2f} - IRRF R$ {irrf:.2f} = **R$ {valor_darf:.2f}**")
+                    st.warning("⚠️ Vencimento: Último dia útil do mês seguinte.")
+                elif valor_darf > 0:
+                    st.info(f"### Valor acumulado: R$ {valor_darf:,.2f}")
+                    st.write("DARF menor que R$ 10,00 não é paga agora. Acumule para o próximo mês.")
+                else:
+                    st.success("### Isento: O IRRF cobriu o imposto devido.")
+            else:
+                novo_prejuizo = abs(base_calculo)
+                st.error(f"### 📉 Prejuízo a Declarar: R$ {novo_prejuizo:,.2f}")
+                st.write("Anote este valor! Você deve usá-lo no campo 'Prejuízo Acumulado' no próximo mês para abater lucros futuros.")
+                
         else:
-            st.error("Erro: Coluna de Resultado não encontrada no arquivo.")
+            st.error(f"Não consegui ler a nota. Erro: {dados['erro']}")

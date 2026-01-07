@@ -4,9 +4,10 @@ import google.generativeai as genai
 import io
 import json
 import re
+import time
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Gym Trade Pro", layout="wide", page_icon="🤖")
+st.set_page_config(page_title="Gym Trade Pro", layout="wide", page_icon="💪")
 
 try:
     chave = st.secrets["GOOGLE_API_KEY"]
@@ -39,54 +40,27 @@ def limpar_json(texto):
         return {"erro": "Erro no JSON"}
     except: return {"erro": "Erro JSON"}
 
-# --- AUTO-DETECÇÃO DE MODELO (A SOLUÇÃO) ---
-@st.cache_resource
-def descobrir_modelo_ativo():
-    """
-    Pergunta para a API quais modelos estão disponíveis e escolhe o melhor.
-    Evita erros de nome (404).
-    """
-    if not chave: return None
-    
-    try:
-        # Lista tudo que a conta tem acesso
-        modelos = list(genai.list_models())
-        
-        # Prioridade 1: Flash 2.0 ou 1.5 (Rápidos e Vision)
-        for m in modelos:
-            if 'flash' in m.name and 'generateContent' in m.supported_generation_methods:
-                return m.name
-        
-        # Prioridade 2: Pro (Mais inteligentes)
-        for m in modelos:
-            if 'pro' in m.name and 'generateContent' in m.supported_generation_methods:
-                return m.name
-                
-        # Fallback
-        return 'models/gemini-1.5-flash'
-    except Exception as e:
-        return None
+# --- SELEÇÃO DE MODELO ECONÔMICO ---
+def get_model():
+    """Retorna o modelo 1.5 Flash que tem limites altos (1500 req/dia)"""
+    return genai.GenerativeModel('models/gemini-1.5-flash')
 
 # --- COACH ---
 def chamar_coach(texto_usuario):
     if not chave: return "Erro: API Key não configurada."
     
-    nome_modelo = descobrir_modelo_ativo()
-    if not nome_modelo: return "Erro: Nenhum modelo de IA encontrado na conta."
-
     try:
-        ia = genai.GenerativeModel(nome_modelo)
+        ia = get_model()
         resp = ia.generate_content(f"Aja como um Coach Trader experiente e breve. Analise: {texto_usuario}")
         return resp.text
     except Exception as e:
+        if "429" in str(e):
+            return "⏳ Calma! Você atingiu o limite de velocidade. Espere 1 minuto."
         return f"Erro técnico no Coach: {str(e)}"
 
 # --- LEITOR DE NOTA ---
 def ler_nota_corretagem(arquivo_pdf):
     if not chave: return {"erro": "Sem API Key."}
-
-    nome_modelo = descobrir_modelo_ativo()
-    if not nome_modelo: return {"erro": "Não foi possível detectar um modelo de IA ativo na sua conta Google."}
 
     try:
         bytes_pdf = arquivo_pdf.getvalue()
@@ -99,12 +73,11 @@ def ler_nota_corretagem(arquivo_pdf):
         
         1. "valor_negocios_explicito":
            - Procure campos: "Valor dos Negócios", "Total Líquido", "Ajuste Day Trade".
-           - Exemplo CM Capital: Pode estar no meio da nota (Ex: 30,00 C).
-           - Exemplo Clear: Geralmente no topo.
-           - Se 'C' = positivo, se 'D' = negativo.
+           - Se tiver letra 'C' = positivo, se 'D' = negativo.
+           - ATENÇÃO: Na CM Capital, este valor pode estar no meio da nota (Ex: 30,00 C).
         
         2. "custos_totais":
-           - Some TODAS as taxas do rodapé (Liq + Reg + Emol + Corr + ISS).
+           - Vá ao rodapé. Some: Taxa de Liquidação + Taxa de Registro + Emolumentos + Corretagem + ISS.
         
         3. "irrf": Valor do I.R.R.F.
         
@@ -123,23 +96,23 @@ def ler_nota_corretagem(arquivo_pdf):
         }
         """
         
-        ia = genai.GenerativeModel(nome_modelo)
+        ia = get_model()
         resp = ia.generate_content([prompt, part])
         return limpar_json(resp.text)
         
     except Exception as e:
-        # AQUI ESTÁ A CORREÇÃO: Retorna o erro real para vermos
-        return {"erro": f"Erro técnico ao ler PDF: {str(e)}"}
+        if "429" in str(e):
+            return {"erro": "⏳ Limite de requisições excedido. Aguarde 1 minuto."}
+        return {"erro": f"Erro técnico: {str(e)}"}
 
 # --- INTERFACE ---
 st.title("🎯 Gym Trade Pro")
 
-# Mostra qual modelo foi detectado (DEBUG)
-modelo_atual = descobrir_modelo_ativo()
-if modelo_atual:
-    st.caption(f"✅ Sistema conectado ao cérebro: `{modelo_atual}`")
+# Status da Conexão
+if chave:
+    st.caption("✅ Sistema Operacional (Modo 1.5 Flash)")
 else:
-    st.error("❌ Erro grave: Não consegui listar modelos da sua conta Google.")
+    st.error("❌ Configure a API Key")
 
 aba_treino, aba_contador = st.tabs(["📊 Profit & Coach", "📝 Nota Fiscal"])
 
@@ -164,10 +137,10 @@ with aba_treino:
                 c2.metric("Trades", trades)
                 
                 if st.button("🧠 Coach"):
-                    with st.spinner("Conectando..."):
+                    with st.spinner("Analisando..."):
                         msg = chamar_coach(f"Fiz {formatar_real(total)} em {trades} operações.")
-                        if "Erro" in msg:
-                            st.error(msg)
+                        if "⏳" in msg:
+                            st.warning(msg)
                         else:
                             st.info(f"💡 {msg}")
                 st.dataframe(df)
@@ -185,9 +158,7 @@ with aba_contador:
             d = ler_nota_corretagem(pdf)
         
         if "erro" in d:
-            # MOSTRA O ERRO REAL NA TELA
             st.error(f"❌ {d['erro']}")
-            st.warning("Se o erro for '404', tente dar Reboot no App.")
         else:
             vlr_negocios = converter_para_float(d.get('valor_negocios_explicito', 0))
             creditos = converter_para_float(d.get('soma_creditos', 0))
@@ -197,7 +168,7 @@ with aba_contador:
             data = d.get('data', '-')
             corretora = d.get('corretora', '-')
             
-            # Lógica Híbrida
+            # Lógica Híbrida: Prioriza valor explícito > cálculo
             if abs(vlr_negocios) > 0.01:
                 bruto = vlr_negocios
                 fonte = "Campo 'Valor dos Negócios'"
@@ -209,7 +180,6 @@ with aba_contador:
             base = liq_op - prejuizo
             
             st.success(f"Nota Processada: {data} ({corretora})")
-            st.caption(f"Fonte do dado: {fonte}")
             
             k1, k2, k3 = st.columns(3)
             k1.metric("Bruto (Ajuste)", formatar_real(bruto))

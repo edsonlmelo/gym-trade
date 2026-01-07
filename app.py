@@ -30,14 +30,14 @@ def limpar_json(texto):
 def analisar_pdf_com_tentativas(arquivo_pdf):
     if not chave: return {"erro": "Chave API não configurada."}
 
-    # Lista de nomes para tentar (Força Bruta)
-    # Tenta um por um até funcionar
+    # LISTA ATUALIZADA COM BASE NO SEU DIAGNÓSTICO
+    # Prioridade para o 2.0 Flash e 2.5 Flash que sua conta possui
     candidatos = [
-        "gemini-1.5-flash",          # Nome padrão
-        "gemini-1.5-flash-latest",   # Variação comum
-        "gemini-1.5-flash-001",      # Versão específica
-        "gemini-1.5-pro",            # Alternativa mais potente
-        "gemini-1.5-pro-latest"
+        "gemini-2.0-flash",          # O mais estável para visão
+        "gemini-2.5-flash",          # O mais novo
+        "gemini-flash-latest",       # Genérico
+        "models/gemini-2.0-flash",   # Variação com prefixo
+        "models/gemini-2.5-flash"
     ]
     
     bytes_pdf = arquivo_pdf.getvalue()
@@ -48,7 +48,7 @@ def analisar_pdf_com_tentativas(arquivo_pdf):
     
     MISSÃO: Calcular o Resultado Líquido de Day Trade (WDO/WIN).
     
-    1. Ignore "Valor dos Negócios" se zerado.
+    1. Ignore "Valor dos Negócios" se estiver zerado.
     2. Identifique os AJUSTES na tabela de negócios:
        - Valores com 'C' são Créditos (+).
        - Valores com 'D' são Débitos (-).
@@ -67,26 +67,33 @@ def analisar_pdf_com_tentativas(arquivo_pdf):
     }
     """
 
-    ultimo_erro = ""
+    erros_log = []
 
     # LOOP DE TENTATIVAS
     for nome_modelo in candidatos:
         try:
+            # Tenta criar o modelo
             model = genai.GenerativeModel(nome_modelo)
+            # Tenta gerar o conteúdo
             response = model.generate_content([prompt, part_arquivo])
             
-            # Se chegou aqui, funcionou!
+            # Se não der erro, processa o JSON
             dados = limpar_json(response.text)
-            dados['modelo_sucesso'] = nome_modelo # Marca qual funcionou
+            
+            # Se o JSON vier com erro interno, considera falha e tenta o próximo
+            if "erro" in dados:
+                erros_log.append(f"{nome_modelo}: JSON inválido")
+                continue
+
+            dados['modelo_sucesso'] = nome_modelo 
             return dados
             
         except Exception as e:
-            # Se der erro, guarda a mensagem e tenta o próximo da lista
-            ultimo_erro = str(e)
+            erros_log.append(f"{nome_modelo}: {str(e)}")
             continue
     
     # Se sair do loop, todos falharam
-    return {"erro": f"Todos os modelos falharam. Último erro: {ultimo_erro}"}
+    return {"erro": f"Todos falharam. Logs: {'; '.join(erros_log)}"}
 
 def converter_para_float(valor):
     if isinstance(valor, (int, float)): return float(valor)
@@ -113,7 +120,6 @@ if not chave:
     st.error("Chave API não configurada.")
     st.stop()
 
-# CRIA 3 ABAS AGORA
 aba1, aba2, aba3 = st.tabs(["🏋️‍♂️ Treino", "💰 Contador", "🔧 Diagnóstico"])
 
 with aba1:
@@ -131,29 +137,28 @@ with aba1:
                 c2.metric("Trades", trd)
                 if st.button("Coach"):
                     try:
-                        # Tenta modelo padrão para texto
-                        model = genai.GenerativeModel('gemini-1.5-flash')
+                        # Tenta usar o 2.0 Flash para o Coach também
+                        model = genai.GenerativeModel('gemini-2.0-flash')
                         msg = model.generate_content(f"Trader: R$ {res:.2f}, {trd} trades. Feedback.").text
                         st.info(msg)
                     except:
-                        st.error("Erro no Coach. Tente a aba Diagnóstico.")
+                        st.error("Erro no Coach.")
                 st.dataframe(df)
 
 with aba2:
-    st.header("Leitor Fiscal (Auto-Repair)")
-    st.caption("O sistema tentará 5 modelos diferentes até conseguir ler sua nota.")
+    st.header("Leitor Fiscal (Gemini 2.0/2.5)")
+    st.caption("Usando modelos de última geração detectados na sua conta.")
     
     c1,c2 = st.columns(2)
     pdf = c1.file_uploader("Nota PDF", type=["pdf"], key="pdf_brute")
     prej = c2.number_input("Prejuízo Anterior", 0.0, step=10.0)
     
     if pdf:
-        with st.spinner("Testando modelos de IA..."):
+        with st.spinner("Analisando visualmente..."):
             dados = analisar_pdf_com_tentativas(pdf)
         
         if "erro" in dados:
-            st.error(f"❌ Falha Total: {dados['erro']}")
-            st.info("Vá na aba '🔧 Diagnóstico' para ver o que está acontecendo.")
+            st.error(f"❌ Falha: {dados['erro']}")
         else:
             liq = converter_para_float(dados.get('resultado_liquido_nota', 0))
             custos = converter_para_float(dados.get('total_custos', 0))
@@ -162,8 +167,8 @@ with aba2:
             raciocinio = dados.get('raciocinio', '-')
             modelo_ok = dados.get('modelo_sucesso', 'Desconhecido')
             
-            st.success(f"✅ Nota Lida com Sucesso! (Usando: {modelo_ok})")
-            st.info(f"🧠 **Raciocínio:** {raciocinio}")
+            st.success(f"✅ Nota Lida! (Modelo: {modelo_ok})")
+            st.info(f"🧠 **Lógica:** {raciocinio}")
             
             # Edição
             with st.expander("📝 Ajuste Manual"):
@@ -191,19 +196,10 @@ with aba2:
                 st.error(f"Prejuízo a Acumular: R$ {abs(base_calculo):,.2f}")
 
 with aba3:
-    st.header("🔧 Diagnóstico de API")
-    if st.button("Listar Modelos Disponíveis"):
+    st.header("🔧 Diagnóstico")
+    if st.button("Listar Modelos"):
         try:
-            st.write("Consultando Google API...")
-            modelos = []
-            for m in genai.list_models():
-                modelos.append(f"Nome: `{m.name}` | Métodos: {m.supported_generation_methods}")
-            
-            if modelos:
-                st.success(f"Encontrados {len(modelos)} modelos disponíveis para sua chave:")
-                for mod in modelos:
-                    st.markdown(mod)
-            else:
-                st.warning("A API respondeu, mas a lista de modelos veio vazia.")
+            modelos = [m.name for m in genai.list_models()]
+            st.write(modelos)
         except Exception as e:
-            st.error(f"Erro ao conectar na API: {e}")
+            st.error(str(e))

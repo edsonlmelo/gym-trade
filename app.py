@@ -6,7 +6,7 @@ import json
 import re
 
 # Configuração da Página
-st.set_page_config(page_title="Gym Trade Pro", layout="wide", page_icon="📈")
+st.set_page_config(page_title="Gym Trade Pro", layout="wide", page_icon="🇧🇷")
 
 # --- AUTENTICAÇÃO ---
 try:
@@ -17,7 +17,17 @@ except:
 if chave:
     genai.configure(api_key=chave)
 
-# --- FUNÇÕES ---
+# --- FUNÇÕES DE FORMATAÇÃO (BRASIL) ---
+
+def formatar_real(valor):
+    """
+    Transforma 5278.50 em 'R$ 5.278,50' (Padrão Brasileiro)
+    """
+    if not isinstance(valor, (int, float)): return "R$ 0,00"
+    # Formata como americano primeiro (1,000.00)
+    texto = f"R$ {valor:,.2f}"
+    # Troca os sinais: Vírgula vira X, Ponto vira Vírgula, X vira Ponto
+    return texto.replace(",", "X").replace(".", ",").replace("X", ".")
 
 def limpar_json(texto):
     try:
@@ -27,73 +37,55 @@ def limpar_json(texto):
         return {"erro": "IA não retornou JSON válido."}
     except: return {"erro": "Erro ao processar JSON."}
 
-def analisar_pdf_com_tentativas(arquivo_pdf):
+def analisar_pdf_ptbr(arquivo_pdf):
     if not chave: return {"erro": "Chave API não configurada."}
 
-    # LISTA ATUALIZADA COM BASE NO SEU DIAGNÓSTICO
-    # Prioridade para o 2.0 Flash e 2.5 Flash que sua conta possui
+    # Modelos modernos detectados na sua conta
     candidatos = [
-        "gemini-2.0-flash",          # O mais estável para visão
-        "gemini-2.5-flash",          # O mais novo
-        "gemini-flash-latest",       # Genérico
-        "models/gemini-2.0-flash",   # Variação com prefixo
-        "models/gemini-2.5-flash"
+        "gemini-2.0-flash",
+        "gemini-2.5-flash", 
+        "models/gemini-2.0-flash",
+        "gemini-1.5-flash"
     ]
     
     bytes_pdf = arquivo_pdf.getvalue()
     part_arquivo = {"mime_type": "application/pdf", "data": bytes_pdf}
 
     prompt = """
-    Você é um Auditor Contábil (B3). Analise visualmente esta Nota de Corretagem (PDF).
+    Você é um Auditor Contábil Brasileiro. Analise visualmente esta Nota de Corretagem.
     
-    MISSÃO: Calcular o Resultado Líquido de Day Trade (WDO/WIN).
+    CALCULE O RESULTADO LÍQUIDO (DAY TRADE WDO/WIN).
     
-    1. Ignore "Valor dos Negócios" se estiver zerado.
-    2. Identifique os AJUSTES na tabela de negócios:
-       - Valores com 'C' são Créditos (+).
-       - Valores com 'D' são Débitos (-).
-       - Somatória Bruta = (Soma C) - (Soma D).
-    3. Identifique e some os CUSTOS no rodapé (Taxas, Emolumentos, Corretagem, ISS).
-    4. Líquido Final = Somatória Bruta - Custos Totais.
+    1. Ignore "Valor dos Negócios" se zerado.
+    2. AJUSTES (Crédito vs Débito):
+       - Identifique valores com 'C' (+) e 'D' (-).
+       - Bruto = (Soma C) - (Soma D).
+    3. CUSTOS:
+       - Some Taxas B3 + Corretagem + ISS no rodapé.
+    4. LÍQUIDO = Bruto - Custos.
     
     Retorne JSON:
     {
-        "modelo_usado": "Nome do modelo aqui",
         "total_custos": 0.00,
         "irrf": 0.00,
         "resultado_liquido_nota": 0.00,
         "data_pregao": "DD/MM/AAAA",
-        "raciocinio": "Vi ajustes C e D. Diferença X. Menos custos Y."
+        "raciocinio": "Explique a conta."
     }
     """
 
-    erros_log = []
-
-    # LOOP DE TENTATIVAS
     for nome_modelo in candidatos:
         try:
-            # Tenta criar o modelo
             model = genai.GenerativeModel(nome_modelo)
-            # Tenta gerar o conteúdo
             response = model.generate_content([prompt, part_arquivo])
-            
-            # Se não der erro, processa o JSON
             dados = limpar_json(response.text)
-            
-            # Se o JSON vier com erro interno, considera falha e tenta o próximo
-            if "erro" in dados:
-                erros_log.append(f"{nome_modelo}: JSON inválido")
-                continue
-
-            dados['modelo_sucesso'] = nome_modelo 
-            return dados
-            
-        except Exception as e:
-            erros_log.append(f"{nome_modelo}: {str(e)}")
+            if "erro" not in dados:
+                dados['modelo_usado'] = nome_modelo
+                return dados
+        except:
             continue
     
-    # Se sair do loop, todos falharam
-    return {"erro": f"Todos falharam. Logs: {'; '.join(erros_log)}"}
+    return {"erro": "Não foi possível ler a nota com nenhum modelo."}
 
 def converter_para_float(valor):
     if isinstance(valor, (int, float)): return float(valor)
@@ -117,10 +109,10 @@ def carregar_csv_blindado(f):
 st.title("📈 Gym Trade Pro")
 
 if not chave:
-    st.error("Chave API não configurada.")
+    st.error("Configure a API Key nos Secrets.")
     st.stop()
 
-aba1, aba2, aba3 = st.tabs(["🏋️‍♂️ Treino", "💰 Contador", "🔧 Diagnóstico"])
+aba1, aba2 = st.tabs(["🏋️‍♂️ Treino", "💰 Contador"])
 
 with aba1:
     f = st.file_uploader("CSV Profit", type=["csv"])
@@ -133,55 +125,53 @@ with aba1:
                 res = df['V'].sum()
                 trd = len(df)
                 c1,c2 = st.columns(2)
-                c1.metric("Resultado", f"R$ {res:,.2f}")
+                
+                # Exibe formatado BR
+                c1.metric("Resultado", formatar_real(res))
                 c2.metric("Trades", trd)
+                
                 if st.button("Coach"):
                     try:
-                        # Tenta usar o 2.0 Flash para o Coach também
                         model = genai.GenerativeModel('gemini-2.0-flash')
-                        msg = model.generate_content(f"Trader: R$ {res:.2f}, {trd} trades. Feedback.").text
+                        msg = model.generate_content(f"Trader fez {formatar_real(res)} em {trd} trades. Feedback curto.").text
                         st.info(msg)
-                    except:
-                        st.error("Erro no Coach.")
+                    except: st.error("Erro Coach")
                 st.dataframe(df)
 
 with aba2:
-    st.header("Leitor Fiscal (Gemini 2.0/2.5)")
-    st.caption("Usando modelos de última geração detectados na sua conta.")
+    st.header("Leitor Fiscal (Padrão Brasil 🇧🇷)")
     
     c1,c2 = st.columns(2)
-    pdf = c1.file_uploader("Nota PDF", type=["pdf"], key="pdf_brute")
-    prej = c2.number_input("Prejuízo Anterior", 0.0, step=10.0)
+    pdf = c1.file_uploader("Nota PDF", type=["pdf"], key="pdf_br")
+    prej = c2.number_input("Prejuízo Anterior (R$)", 0.0, step=10.0)
     
     if pdf:
-        with st.spinner("Analisando visualmente..."):
-            dados = analisar_pdf_com_tentativas(pdf)
+        with st.spinner("Auditando..."):
+            dados = analisar_pdf_ptbr(pdf)
         
         if "erro" in dados:
-            st.error(f"❌ Falha: {dados['erro']}")
+            st.error(f"Erro: {dados['erro']}")
         else:
             liq = converter_para_float(dados.get('resultado_liquido_nota', 0))
             custos = converter_para_float(dados.get('total_custos', 0))
             irrf = converter_para_float(dados.get('irrf', 0))
             data = dados.get('data_pregao', '-')
-            raciocinio = dados.get('raciocinio', '-')
-            modelo_ok = dados.get('modelo_sucesso', 'Desconhecido')
             
-            st.success(f"✅ Nota Lida! (Modelo: {modelo_ok})")
-            st.info(f"🧠 **Lógica:** {raciocinio}")
+            st.success(f"Nota Processada: {data}")
             
-            # Edição
-            with st.expander("📝 Ajuste Manual"):
+            # Edição (Manual se precisar)
+            with st.expander("📝 Conferência Manual"):
                 col_m1, col_m2, col_m3 = st.columns(3)
-                liq = col_m1.number_input("Líquido", value=liq, step=1.0)
-                custos = col_m2.number_input("Custos", value=custos, step=0.1)
-                irrf = col_m3.number_input("IRRF", value=irrf, step=0.1)
+                liq = col_m1.number_input("Líquido", value=liq, step=1.0, format="%.2f")
+                custos = col_m2.number_input("Custos", value=custos, step=0.1, format="%.2f")
+                irrf = col_m3.number_input("IRRF", value=irrf, step=0.1, format="%.2f")
             
+            # Painel com formatação Brasileira
             k1, k2, k3 = st.columns(3)
             cor = "normal" if liq >= 0 else "inverse"
-            k1.metric("Líquido Final", f"R$ {liq:,.2f}", delta_color=cor)
-            k2.metric("Custos", f"R$ {custos:,.2f}")
-            k3.metric("IRRF", f"R$ {irrf:,.2f}")
+            k1.metric("Líquido Final", formatar_real(liq), delta_color=cor)
+            k2.metric("Custos", formatar_real(custos))
+            k3.metric("IRRF", formatar_real(irrf))
             
             base_calculo = (liq + irrf) - prej
             
@@ -189,17 +179,15 @@ with aba2:
             if base_calculo > 0:
                 imposto = base_calculo * 0.20
                 pagar = imposto - irrf
-                if pagar >= 10: st.success(f"### PAGAR DARF: R$ {pagar:,.2f}")
-                elif pagar > 0: st.warning(f"Acumular: R$ {pagar:,.2f}")
-                else: st.success("Isento")
+                
+                if pagar >= 10:
+                    st.success(f"### 📄 DARF A PAGAR: {formatar_real(pagar)}")
+                    st.write(f"Base de Cálculo: {formatar_real(base_calculo)}")
+                elif pagar > 0:
+                    st.warning(f"### Acumular: {formatar_real(pagar)}")
+                    st.caption("Valor inferior a R$ 10,00. Pague apenas quando acumular.")
+                else:
+                    st.success("### Isento")
+                    st.caption("IRRF cobriu o imposto.")
             else:
-                st.error(f"Prejuízo a Acumular: R$ {abs(base_calculo):,.2f}")
-
-with aba3:
-    st.header("🔧 Diagnóstico")
-    if st.button("Listar Modelos"):
-        try:
-            modelos = [m.name for m in genai.list_models()]
-            st.write(modelos)
-        except Exception as e:
-            st.error(str(e))
+                st.error(f"### Prejuízo a Acumular: {formatar_real(abs(base_calculo))}")

@@ -3,6 +3,7 @@ import pandas as pd
 import google.generativeai as genai
 import io
 import pdfplumber
+import pypdf
 import json
 import re
 
@@ -19,8 +20,8 @@ if chave:
     genai.configure(api_key=chave)
 
 # --- FUNÇÕES ---
+
 def obter_modelo_disponivel():
-    """Busca o modelo disponível"""
     try:
         modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         for m in modelos: 
@@ -37,59 +38,79 @@ def limpar_json(texto):
         return {"erro": "IA não retornou JSON válido."}
     except: return {"erro": "Erro ao processar JSON."}
 
-def extrair_dados_pdf_plumber(arquivo_pdf):
-    if not chave: return {"erro": "Chave API não configurada."}, ""
-
+def extrair_texto_hibrido(arquivo_pdf):
+    """
+    Tenta ler com PDFPlumber. Se falhar, tenta com PyPDF.
+    Garante que o texto seja extraído de qualquer jeito.
+    """
+    texto_final = ""
+    metodo_usado = ""
+    
+    # TENTATIVA 1: PDFPlumber (Melhor para tabelas)
     try:
-        texto_completo = ""
-        # Usa pdfplumber para extração robusta
         with pdfplumber.open(arquivo_pdf) as pdf:
             for page in pdf.pages:
-                texto_completo += page.extract_text() + "\n"
+                texto_final += page.extract_text() or ""
+        metodo_usado = "PDFPlumber"
+    except:
+        pass
         
-        if len(texto_completo) < 50:
-             return {"erro": "O PDF parece vazio ou é uma imagem. Tente 'Imprimir como PDF' novamente."}, texto_completo
+    # TENTATIVA 2: PyPDF (Melhor para texto cru) - Fallback
+    if len(texto_final) < 50:
+        try:
+            # Reseta o ponteiro do arquivo para ler do zero
+            arquivo_pdf.seek(0)
+            leitor = pypdf.PdfReader(arquivo_pdf)
+            texto_final = ""
+            for page in leitor.pages:
+                texto_final += page.extract_text() or ""
+            metodo_usado = "PyPDF (Fallback)"
+        except Exception as e:
+            return "", f"Erro em ambos: {str(e)}"
+            
+    return texto_final, metodo_usado
 
+def analisar_nota_ia(texto_completo):
+    if not chave: return {"erro": "Chave API não configurada."}
+    if len(texto_completo) < 50: return {"erro": "Não foi possível ler texto do PDF. O arquivo pode ser imagem."}
+
+    try:
         nome_modelo = obter_modelo_disponivel()
         model = genai.GenerativeModel(nome_modelo)
         
-        # PROMPT ESPECÍFICO PARA CM CAPITAL / FUTUROS
+        # PROMPT ESPECÍFICO PARA SUA NOTA (CM CAPITAL WDO)
         prompt = f"""
-        Você é um auditor contábil perito em B3.
-        Analise o texto cru desta Nota de Corretagem (CM Capital/Sinacor):
+        Aja como um contador auditor. Analise o texto desta Nota de Corretagem (CM Capital):
         
-        --- INÍCIO DO TEXTO ---
+        --- TEXTO DA NOTA ---
         {texto_completo[:15000]}
-        --- FIM DO TEXTO ---
+        --- FIM ---
         
-        Sua missão é calcular o RESULTADO LÍQUIDO DO DIA (Day Trade).
+        OBJETIVO: Calcular o Resultado Líquido do Pregão.
         
-        Regras de Cálculo (Siga passo a passo):
-        1. Identifique operações de Futuros (WDO/WIN).
-        2. Para cada operação, ignore o preço de abertura. Olhe apenas os AJUSTES.
-           - Valores com 'C' são Créditos (Positivos).
-           - Valores com 'D' são Débitos (Negativos).
-           - Exemplo: 317,87 C e 287,87 D resulta em (+317.87 - 287.87) = +30.00.
-        3. Identifique os CUSTOS (Taxas B3 + Corretagem + ISS).
-        4. O 'resultado_liquido_nota' deve ser: (Soma dos Ajustes) - (Total de Custos).
-           - NÃO use o valor de "Valor dos Negócios" se estiver zerado.
-           - NÃO use saldo de conta corrente.
+        INSTRUÇÕES DE RASTREIO:
+        1. Procure pelas linhas que contêm "WDO" ou "WIN" (Futuros).
+        2. Ao lado delas, procure valores com "C" (Crédito) ou "D" (Débito).
+           - Exemplo no texto: "317,87 C" é lucro bruto. "287,87 D" é prejuízo bruto.
+        3. Calcule o AJUSTE DO DIA: (Soma dos Créditos) - (Soma dos Débitos).
+           - Ex: 317,87 - 287,87 = 30,00 Positivo.
+        4. Identifique e some as TAXAS/CUSTOS (Taxa Liq, Registro, Emol, Corretagem, ISS).
+        5. O Resultado Líquido Final é: (Ajuste do Dia) - (Total de Custos).
         
-        Retorne APENAS um JSON:
+        Retorne JSON:
         {{
-            "total_custos": "Valor total das taxas (float)",
-            "irrf": "Valor do IRRF (float)",
-            "resultado_liquido_nota": "Valor calculado do lucro/prejuízo liquido (float)",
+            "total_custos": "valor float",
+            "irrf": "valor float (se houver)",
+            "resultado_liquido_nota": "valor float (Ajuste - Custos)",
             "data_pregao": "DD/MM/AAAA",
-            "explicação": "Uma frase curta explicando a conta que você fez (ex: Ajuste 317C - 287D - taxas)"
+            "logica_usada": "Explique quais valores C e D você encontrou e a conta feita."
         }}
         """
         
         response = model.generate_content(prompt)
-        return limpar_json(response.text), texto_completo
-        
+        return limpar_json(response.text)
     except Exception as e:
-        return {"erro": str(e)}, ""
+        return {"erro": str(e)}
 
 def converter_para_float(valor):
     if isinstance(valor, (int, float)): return float(valor)
@@ -116,7 +137,7 @@ if not chave:
     st.error("Chave API não configurada.")
     st.stop()
 
-aba1, aba2 = st.tabs(["🏋️‍♂️ Treino", "💰 Contador (PDF)"])
+aba1, aba2 = st.tabs(["🏋️‍♂️ Treino", "💰 Contador Híbrido"])
 
 with aba1:
     f = st.file_uploader("CSV Profit", type=["csv"])
@@ -138,29 +159,33 @@ with aba1:
                 st.dataframe(df)
 
 with aba2:
-    st.header("Leitor Fiscal (PDF)")
+    st.header("Leitor Fiscal (CM Capital)")
     c1,c2 = st.columns(2)
-    # Importante: seek(0) é feito internamente pelo pdfplumber, mas garantimos refresh
-    pdf = c1.file_uploader("Nota PDF", type=["pdf"], key="pdf_up")
+    pdf = c1.file_uploader("Nota PDF", type=["pdf"], key="pdf_hibrido")
     prej = c2.number_input("Prejuízo Anterior", 0.0, step=10.0)
     
     if pdf:
-        with st.spinner("Extraindo dados com PDFPlumber..."):
-            dados, texto_debug = extrair_dados_pdf_plumber(pdf)
+        with st.spinner("Motor Híbrido lendo nota..."):
+            # 1. Extrai Texto (Tenta Plumber -> Tenta PyPDF)
+            texto_extraido, metodo = extrair_texto_hibrido(pdf)
+            
+            # 2. Envia para IA
+            dados = analisar_nota_ia(texto_extraido)
         
         if "erro" in dados:
             st.error(f"Erro: {dados['erro']}")
-            with st.expander("🛠️ Ver Texto Lido (Debug)"):
-                st.text(texto_debug)
+            st.warning(f"Método tentado: {metodo}")
+            with st.expander("Ver Texto Extraído (Debug)"):
+                st.text(texto_extraido)
         else:
             liq = converter_para_float(dados.get('resultado_liquido_nota', 0))
             custos = converter_para_float(dados.get('total_custos', 0))
             irrf = converter_para_float(dados.get('irrf', 0))
             data = dados.get('data_pregao', '-')
-            explicacao = dados.get('explicação', '-')
+            logica = dados.get('logica_usada', '-')
             
-            st.success(f"Nota de {data}")
-            st.info(f"🧠 **Raciocínio da IA:** {explicacao}")
+            st.success(f"Nota Processada ({metodo}) - Data: {data}")
+            st.info(f"🧠 **Lógica da IA:** {logica}")
             
             k1, k2, k3 = st.columns(3)
             cor = "normal" if liq >= 0 else "inverse"
@@ -168,9 +193,6 @@ with aba2:
             k2.metric("Custos", f"R$ {custos:,.2f}")
             k3.metric("IRRF", f"R$ {irrf:,.2f}")
             
-            # Cálculo Imposto
-            # Base = (Líquido + IRRF) - Prejuizo
-            # (Porque o liquido já descontou taxas, mas o IRRF faz parte do lucro tributável antes de ser abatido no fim)
             base_calculo = (liq + irrf) - prej
             
             st.divider()
@@ -182,6 +204,6 @@ with aba2:
                 else: st.success("Isento")
             else:
                 st.error(f"Prejuízo a Acumular: R$ {abs(base_calculo):,.2f}")
-
-            with st.expander("🔍 Ver Texto Bruto da Nota"):
-                st.text(texto_debug)
+            
+            with st.expander("Ver Texto Bruto"):
+                st.text(texto_extraido)

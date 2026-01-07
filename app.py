@@ -5,7 +5,7 @@ import io
 import json
 import re
 
-# Configuração da Página
+# --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="Gym Trade Pro", layout="wide", page_icon="🇧🇷")
 
 # --- AUTENTICAÇÃO ---
@@ -17,77 +17,16 @@ except:
 if chave:
     genai.configure(api_key=chave)
 
-# --- FORMATAÇÃO BRASIL ---
+# --- FUNÇÕES DE UTILIDADE ---
+
 def formatar_real(valor):
+    """Formata float para R$ 1.234,56"""
     if not isinstance(valor, (int, float)): return "R$ 0,00"
     texto = f"R$ {valor:,.2f}"
     return texto.replace(",", "X").replace(".", ",").replace("X", ".")
 
-def limpar_json(texto):
-    try:
-        padrao = r'\{.*\}'
-        match = re.search(padrao, texto, re.DOTALL)
-        if match: return json.loads(match.group(0))
-        return {"erro": "IA não retornou JSON válido."}
-    except: return {"erro": "Erro ao processar JSON."}
-
-def analisar_pdf_precisao(arquivo_pdf):
-    if not chave: return {"erro": "Chave API não configurada."}
-
-    # Modelos disponíveis
-    candidatos = [
-        "gemini-2.0-flash",
-        "gemini-2.5-flash", 
-        "models/gemini-2.0-flash",
-        "gemini-1.5-flash"
-    ]
-    
-    bytes_pdf = arquivo_pdf.getvalue()
-    part_arquivo = {"mime_type": "application/pdf", "data": bytes_pdf}
-
-    prompt = """
-    Você é um Auditor Contábil. Analise esta Nota de Corretagem (Clear/CM/XP).
-    
-    SUA MISSÃO É APENAS EXTRAIR OS NÚMEROS. NÃO FAÇA CÁLCULOS.
-    
-    Extraia estes 3 valores exatos:
-    
-    1. "bruto_ajustes": 
-       - Em notas CLEAR: Procure por "Ajuste day trade" ou "Total líquido". Se tiver 'C' é positivo.
-       - Em notas CM/XP: É a soma dos ajustes 'C' menos ajustes 'D'.
-       
-    2. "total_custos":
-       - Em notas CLEAR: Procure EXATAMENTE o campo "Total de despesas". Use esse valor.
-       - Em outras: Soma de Taxas B3 + Corretagem + ISS.
-       
-    3. "irrf":
-       - Valor do "IRRF Day Trade" ou "I.R.R.F. s/ operações".
-    
-    Retorne JSON:
-    {
-        "bruto_ajustes": 0.00,
-        "total_custos": 0.00,
-        "irrf": 0.00,
-        "data_pregao": "DD/MM/AAAA",
-        "modelo_usado": "Nome do modelo"
-    }
-    """
-
-    for nome_modelo in candidatos:
-        try:
-            model = genai.GenerativeModel(nome_modelo)
-            response = model.generate_content([prompt, part_arquivo])
-            dados = limpar_json(response.text)
-            
-            if "erro" not in dados and dados.get('bruto_ajustes') != 0:
-                dados['modelo_usado'] = nome_modelo
-                return dados
-        except:
-            continue
-    
-    return {"erro": "Falha na leitura. Tente imprimir o PDF novamente."}
-
 def converter_para_float(valor):
+    """Limpa strings sujas (R$ 1.000,00 D) para float (-1000.00)"""
     if isinstance(valor, (int, float)): return float(valor)
     try:
         texto = str(valor).strip().upper()
@@ -97,6 +36,91 @@ def converter_para_float(valor):
         num = float(texto)
         return -abs(num) if is_negative else abs(num)
     except: return 0.0
+
+def limpar_json(texto):
+    try:
+        padrao = r'\{.*\}'
+        match = re.search(padrao, texto, re.DOTALL)
+        if match: return json.loads(match.group(0))
+        return {"erro": "IA não retornou JSON válido."}
+    except: return {"erro": "Erro ao processar JSON."}
+
+def obter_modelo_seguro():
+    """Retorna um modelo que sabemos que funciona na sua conta"""
+    # Lista baseada no seu diagnóstico
+    return [
+        "gemini-2.0-flash", 
+        "gemini-2.5-flash", 
+        "models/gemini-2.0-flash",
+        "gemini-1.5-flash"
+    ]
+
+# --- FUNÇÃO DO COACH (CORRIGIDA) ---
+def chamar_coach(resumo_texto):
+    if not chave: return "Erro: Chave API não configurada."
+    
+    candidatos = obter_modelo_seguro()
+    
+    for nome_modelo in candidatos:
+        try:
+            model = genai.GenerativeModel(nome_modelo)
+            response = model.generate_content(resumo_texto)
+            return response.text
+        except:
+            continue
+            
+    return "O Coach está indisponível no momento (Erro de API)."
+
+# --- FUNÇÃO DO LEITOR UNIVERSAL (PDF) ---
+def analisar_pdf_universal(arquivo_pdf):
+    if not chave: return {"erro": "Chave API não configurada."}
+
+    bytes_pdf = arquivo_pdf.getvalue()
+    part_arquivo = {"mime_type": "application/pdf", "data": bytes_pdf}
+
+    # PROMPT HÍBRIDO: Atende CLEAR (Explícito) e CM (Cálculo)
+    prompt = """
+    Você é um Auditor Contábil Sênior. Analise visualmente esta Nota de Corretagem.
+    
+    EXTRAIA OS VALORES PARA APURAÇÃO DE DAY TRADE (WDO/WIN).
+    
+    1. CUSTOS TOTAIS:
+       - Some TODAS as despesas no rodapé: Taxa Operacional/Liquidação + Registro + Emolumentos + Corretagem + ISS/PIS/COFINS.
+       
+    2. IRRF:
+       - Valor do "I.R.R.F. s/ operações" ou "IRRF Day Trade".
+       
+    3. RESULTADO BRUTO (Busque de duas formas):
+       - FORMA A (Explícita): Procure por um campo final chamado "Total Líquido", "Ajuste Day Trade" ou "Total Nota".
+       - FORMA B (Cálculo de Ajustes): Olhe a tabela de negócios. Some os valores 'C' (Crédito) e subtraia os valores 'D' (Débito).
+         Ex: 317,87 C e 287,87 D = (317.87 - 287.87) = 30.00.
+    
+    Retorne JSON:
+    {
+        "custos_totais": 0.00,
+        "irrf": 0.00,
+        "bruto_explicito": 0.00,
+        "bruto_calculado_ajustes": 0.00,
+        "data_pregao": "DD/MM/AAAA",
+        "modelo_usado": "Nome do modelo"
+    }
+    """
+
+    candidatos = obter_modelo_seguro()
+
+    for nome_modelo in candidatos:
+        try:
+            model = genai.GenerativeModel(nome_modelo)
+            response = model.generate_content([prompt, part_arquivo])
+            dados = limpar_json(response.text)
+            
+            if "erro" not in dados:
+                dados['modelo_usado'] = nome_modelo
+                return dados
+        except:
+            continue
+    
+    return {"erro": "Não foi possível ler a nota. Tente imprimir o PDF novamente."}
 
 def carregar_csv_blindado(f):
     try:
@@ -109,13 +133,14 @@ def carregar_csv_blindado(f):
 st.title("📈 Gym Trade Pro")
 
 if not chave:
-    st.error("Configure a API Key.")
+    st.error("⚠️ API Key não encontrada.")
     st.stop()
 
-aba1, aba2 = st.tabs(["🏋️‍♂️ Treino", "💰 Contador (Python Precision)"])
+aba1, aba2 = st.tabs(["🏋️‍♂️ Treino (CSV)", "💰 Contador Universal (PDF)"])
 
+# --- ABA 1: COACH E TREINO ---
 with aba1:
-    f = st.file_uploader("CSV Profit", type=["csv"])
+    f = st.file_uploader("Relatório Profit (.csv)", type=["csv"])
     if f:
         df = carregar_csv_blindado(f)
         if df is not None:
@@ -124,81 +149,97 @@ with aba1:
                 df['V'] = df[col].apply(converter_para_float)
                 res = df['V'].sum()
                 trd = len(df)
+                
                 c1,c2 = st.columns(2)
                 c1.metric("Resultado", formatar_real(res))
                 c2.metric("Trades", trd)
-                if st.button("Coach"):
-                    try:
-                        model = genai.GenerativeModel('gemini-2.0-flash')
-                        msg = model.generate_content(f"Trader: {res}, {trd} trades. Dica curta.").text
-                        st.info(msg)
-                    except: pass
+                
+                # BOTÃO COACH RESTAURADO
+                if st.button("📢 Coach, analise meu dia"):
+                    with st.spinner("O Coach está pensando..."):
+                        prompt_coach = f"Atue como um mentor de trading duro. O aluno fez {formatar_real(res)} em {trd} operações hoje. Dê um feedback de 2 linhas sobre disciplina e risco."
+                        msg = chamar_coach(prompt_coach)
+                        st.info(f"🤖 **Coach:** {msg}")
+                
                 st.dataframe(df)
 
+# --- ABA 2: CONTADOR UNIVERSAL ---
 with aba2:
-    st.header("Leitor Fiscal de Precisão")
-    st.caption("Cálculo tributário executado via Python (Zero Alucinação).")
+    st.header("Leitor Fiscal Universal 🇧🇷")
+    st.caption("Compatível com Clear, CM Capital, XP, Genial, BTG, etc.")
     
     c1,c2 = st.columns(2)
-    pdf = c1.file_uploader("Nota PDF", type=["pdf"], key="pdf_py")
+    pdf = c1.file_uploader("Nota de Corretagem (PDF)", type=["pdf"], key="pdf_universal")
     prej = c2.number_input("Prejuízo Anterior (R$)", 0.0, step=10.0)
     
     if pdf:
-        with st.spinner("Extraindo dados brutos..."):
-            dados = analisar_pdf_precisao(pdf)
+        with st.spinner("Auditando Nota..."):
+            dados = analisar_pdf_universal(pdf)
         
         if "erro" in dados:
             st.error(f"Erro: {dados['erro']}")
         else:
-            # EXTRAÇÃO DOS DADOS BRUTOS
-            bruto = converter_para_float(dados.get('bruto_ajustes', 0))
-            custos = converter_para_float(dados.get('total_custos', 0))
+            # EXTRAÇÃO
+            custos = converter_para_float(dados.get('custos_totais', 0))
             irrf = converter_para_float(dados.get('irrf', 0))
+            bruto_explicito = converter_para_float(dados.get('bruto_explicito', 0))
+            bruto_calc = converter_para_float(dados.get('bruto_calculado_ajustes', 0))
             data = dados.get('data_pregao', '-')
+            
+            # --- LÓGICA DE DECISÃO PYTHON (O PULO DO GATO) ---
+            # Se tiver valor explícito (Clear), usa. Se for zero (CM), usa o calculado.
+            # Também protegemos contra valores absurdos.
+            if abs(bruto_explicito) > 0.01:
+                bruto_final = bruto_explicito
+                metodo = "Valor da Nota (Explícito)"
+            else:
+                bruto_final = bruto_calc
+                metodo = "Cálculo de Ajustes (C - D)"
             
             st.success(f"Nota Processada: {data}")
             
-            # MOSTRA O QUE A IA LEU
+            # Mostra os dados brutos para transparência
+            with st.expander(f"Detalhes da Leitura ({metodo})"):
+                st.write(f"Bruto Lido na Nota: {formatar_real(bruto_explicito)}")
+                st.write(f"Bruto Calculado (C-D): {formatar_real(bruto_calc)}")
+                st.write(f"Custos Identificados: {formatar_real(custos)}")
+            
+            # --- CÁLCULO TRIBUTÁRIO ---
+            # Base = (Bruto - Custos) - Prejuizo
+            # Nota: O Bruto aqui já é o ajuste financeiro, então subtraímos custos para ter o líquido.
+            lucro_liquido_op = bruto_final - custos
+            base_calculo = lucro_liquido_op - prej
+            
             col1, col2, col3 = st.columns(3)
-            col1.metric("Bruto (Ajustes)", formatar_real(bruto))
-            col2.metric("Total Custos", formatar_real(custos))
+            col1.metric("Resultado Bruto", formatar_real(bruto_final), help=metodo)
+            col2.metric("Custos Totais", formatar_real(custos))
             col3.metric("IRRF Retido", formatar_real(irrf))
 
-            # --- CÁLCULO PYTHON (INFALÍVEL) ---
-            # 1. Lucro Líquido Operacional (Base de Cálculo)
-            base_calculo_op = bruto - custos
-            
-            # 2. Abatimento de Prejuízo
-            base_final = base_calculo_op - prej
-            
             st.divider()
             
-            if base_final > 0:
-                # 3. Imposto Devido (20%)
-                imposto_devido = base_final * 0.20
-                
-                # 4. Valor Final a Pagar (Desconta o Dedo-duro)
+            if base_calculo > 0:
+                imposto_devido = base_calculo * 0.20
                 darf_pagar = imposto_devido - irrf
                 
-                # VISUALIZAÇÃO DA CONTA
-                st.subheader("🧮 Memória de Cálculo Real")
-                st.text(f"  {formatar_real(bruto)} (Bruto)")
-                st.text(f"- {formatar_real(custos)} (Custos)")
-                st.text(f"= {formatar_real(base_calculo_op)} (Lucro Líquido Operacional)")
-                if prej > 0: st.text(f"- {formatar_real(prej)} (Prejuízo Anterior)")
-                st.text(f"= {formatar_real(base_final)} (Base de Cálculo)")
-                st.text(f"x 20% (Alíquota Day Trade)")
-                st.text(f"= {formatar_real(imposto_devido)} (Imposto Devido)")
-                st.text(f"- {formatar_real(irrf)} (IRRF já pago)")
-                st.markdown(f"**= {formatar_real(darf_pagar)} (A PAGAR)**")
+                # LÓGICA DE EXIBIÇÃO
+                st.subheader("🧮 Fechamento")
+                c_a, c_b = st.columns(2)
+                c_a.text(f"  {formatar_real(lucro_liquido_op)} (Líquido Op.)")
+                c_a.text(f"- {formatar_real(prej)} (Prejuízo Ant.)")
+                c_a.text(f"= {formatar_real(base_calculo)} (Base Calc.)")
+                
+                c_b.text(f"  {formatar_real(imposto_devido)} (20% Imposto)")
+                c_b.text(f"- {formatar_real(irrf)} (IRRF)")
+                c_b.markdown(f"**= {formatar_real(darf_pagar)} (A PAGAR)**")
                 
                 if darf_pagar >= 10:
                     st.success(f"### ✅ GERAR DARF: {formatar_real(darf_pagar)}")
                 elif darf_pagar > 0:
                     st.warning(f"### Acumular: {formatar_real(darf_pagar)}")
-                    st.caption("Menor que R$ 10,00. Não pagar agora.")
+                    st.caption("Menor que R$ 10,00. Acumule para o mês que vem.")
                 else:
                     st.success("### Isento (Saldo Credor)")
             
             else:
-                st.error(f"### Prejuízo a Acumular: {formatar_real(abs(base_final))}")
+                st.error(f"### Prejuízo a Acumular: {formatar_real(abs(base_calculo))}")
+                st.caption("Anote este valor para abater no próximo mês.")

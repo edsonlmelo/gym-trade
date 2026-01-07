@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import google.generativeai as genai
 import io
-import pypdf
 import json
 import re
 
@@ -21,14 +20,8 @@ if chave:
 # --- FUNÇÕES ---
 
 def obter_modelo_disponivel():
-    """Busca o modelo disponível"""
-    try:
-        modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        for m in modelos: 
-            if 'flash' in m: return m
-        return 'models/gemini-1.5-flash'
-    except:
-        return 'models/gemini-1.5-flash'
+    # Para leitura de arquivos (Visão), o 1.5 Flash é mandatório
+    return 'models/gemini-1.5-flash'
 
 def limpar_json(texto):
     try:
@@ -38,76 +31,66 @@ def limpar_json(texto):
         return {"erro": "IA não retornou JSON válido."}
     except: return {"erro": "Erro ao processar JSON."}
 
-def extrair_dados_calculadora(arquivo_pdf):
+def analisar_pdf_visao(arquivo_pdf):
     """
-    Usa PyPDF (que funciona no seu arquivo) + Prompt de Cálculo Matemático.
+    ENVIA O ARQUIVO PDF DIRETO PARA A IA (VISÃO COMPUTACIONAL).
+    Ignora problemas de fonte/texto do Python.
     """
-    if not chave: return {"erro": "Chave API não configurada."}, ""
+    if not chave: return {"erro": "Chave API não configurada."}
 
     try:
-        # Extração Simples e Direta
-        leitor = pypdf.PdfReader(arquivo_pdf)
-        texto_completo = ""
-        for page in leitor.pages:
-            texto_completo += page.extract_text() + "\n"
+        # Lê os bytes do arquivo
+        bytes_pdf = arquivo_pdf.getvalue()
         
-        # Verificação de Segurança
-        if len(texto_completo) < 50:
-             return {"erro": "O PDF parece ser uma imagem. O PyPDF não encontrou texto selecionável."}, texto_completo
+        # Prepara o blob para enviar ao Gemini
+        part_arquivo = {
+            "mime_type": "application/pdf",
+            "data": bytes_pdf
+        }
 
         nome_modelo = obter_modelo_disponivel()
         model = genai.GenerativeModel(nome_modelo)
         
-        # PROMPT "CALCULADORA DE AJUSTES"
-        prompt = f"""
-        Você é um auditor contábil. Analise o texto desta Nota de Corretagem (CM Capital - WDO):
+        prompt = """
+        Você é um Auditor Contábil Sênior. Estou te enviando um arquivo PDF de uma Nota de Corretagem (CM Capital).
         
-        --- TEXTO DA NOTA ---
-        {texto_completo[:15000]}
-        --- FIM DO TEXTO ---
+        Sua tarefa é OLHAR para o documento e realizar a apuração fiscal do Day Trade (WDO/WIN).
         
-        O campo "Valor dos Negócios" costuma vir zerado nesta corretora. 
-        VOCÊ DEVE CALCULAR O RESULTADO MANUALMENTE.
+        ATENÇÃO AOS DETALHES VISUAIS:
+        1. Ignore o campo "Valor dos Negócios" se estiver zerado.
+        2. Procure na tabela de negócios os valores de AJUSTE (Coluna "Valor Operação" ou "Ajuste").
+           - Identifique visualmente a letra 'C' (Crédito/Positivo) ou 'D' (Débito/Negativo) ao lado dos números.
+           - Exemplo visual: "317,87 C" conta como +317.87. "287,87 D" conta como -287.87.
+           - FAÇA A CONTA: (Soma de todos os C) - (Soma de todos os D). Esse é o Bruto.
+        3. Procure no rodapé o bloco de CUSTOS/DESPESAS (Taxa Liquidação, Registro, Emolumentos, Corretagem, ISS). Some todos.
+        4. Resultado Líquido Final = (Resultado Bruto calculado) - (Total Custos).
         
-        Siga este roteiro de cálculo:
-        1. Encontre as linhas de negociação (WDO/WIN).
-        2. Identifique os AJUSTES DO DIA (Valores seguidos de C ou D).
-           - Some todos os valores com 'C' (Crédito/Ganho).
-           - Some todos os valores com 'D' (Débito/Perda).
-           - Resultado Bruto = (Soma C) - (Soma D).
-           - Exemplo: "317,87 C" e "287,87 D" -> Bruto = +30,00.
-        3. Encontre e some os CUSTOS: (Taxa Liquidação + Registro + Emolumentos + Corretagem + ISS + Outras taxas).
-        4. Resultado Líquido Final = (Resultado Bruto) - (Total Custos).
-        
-        Retorne JSON:
-        {{
-            "total_custos": "valor float",
-            "irrf": "valor float (se houver)",
-            "resultado_liquido_nota": "valor float (Resultado Líquido Final calculado)",
+        Retorne APENAS este JSON:
+        {
+            "total_custos": 0.00,
+            "irrf": 0.00,
+            "resultado_liquido_nota": 0.00,
             "data_pregao": "DD/MM/AAAA",
-            "memoria_calculo": "Descreva a conta: (Ajuste C - Ajuste D) - Custos"
-        }}
+            "raciocinio": "Vi ajustes de X (C) e Y (D). A diferença é Z. Subtraí custos."
+        }
         """
         
-        response = model.generate_content(prompt)
-        return limpar_json(response.text), texto_completo
+        # Envia Prompt + Arquivo
+        response = model.generate_content([prompt, part_arquivo])
+        return limpar_json(response.text)
         
     except Exception as e:
-        return {"erro": str(e)}, ""
+        return {"erro": f"Erro na Visão IA: {str(e)}"}
 
 def converter_para_float(valor):
     if isinstance(valor, (int, float)): return float(valor)
     try:
         texto = str(valor).strip().upper()
-        # Se a IA já mandou negativo no JSON, respeita.
-        # Se mandou positivo mas com "D", inverte.
+        # Se a IA mandou negativo, mantém. Se mandou positivo com D, inverte.
         is_negative = 'D' in texto or '-' in texto
         texto = texto.replace('R$', '').replace(' ', '').replace('C', '').replace('D', '')
         if ',' in texto: texto = texto.replace('.', '').replace(',', '.')
         num = float(texto)
-        
-        # Se o numero já é negativo (ex: -30.00), abs(num) tira o sinal.
-        # Lógica: Se tem sinal de menos OU 'D', resultado final deve ser negativo.
         return -abs(num) if is_negative else abs(num)
     except: return 0.0
 
@@ -125,7 +108,7 @@ if not chave:
     st.error("Chave API não configurada.")
     st.stop()
 
-aba1, aba2 = st.tabs(["🏋️‍♂️ Treino", "💰 Contador"])
+aba1, aba2 = st.tabs(["🏋️‍♂️ Treino", "💰 Contador (Visão IA)"])
 
 with aba1:
     f = st.file_uploader("CSV Profit", type=["csv"])
@@ -147,34 +130,39 @@ with aba1:
                 st.dataframe(df)
 
 with aba2:
-    st.header("Leitor Fiscal (IA Calculadora)")
-    st.info("Especializado em notas de Futuros (WDO/WIN) da CM Capital.")
+    st.header("Leitor Fiscal (Modo Visão)")
+    st.info("A IA vai 'olhar' o PDF como uma imagem para ignorar erros de formatação.")
     
     c1,c2 = st.columns(2)
-    pdf = c1.file_uploader("Nota PDF", type=["pdf"], key="pdf_calc")
+    pdf = c1.file_uploader("Nota PDF", type=["pdf"], key="pdf_vision")
     prej = c2.number_input("Prejuízo Anterior", 0.0, step=10.0)
     
     if pdf:
-        with st.spinner("Lendo ajustes e calculando custos..."):
-            dados, texto_debug = extrair_dados_calculadora(pdf)
+        with st.spinner("A IA está lendo o documento visualmente..."):
+            dados = analisar_pdf_visao(pdf)
         
         if "erro" in dados:
             st.error(f"Erro: {dados['erro']}")
-            with st.expander("Ver Texto (Debug)"):
-                st.text(texto_debug)
         else:
             liq = converter_para_float(dados.get('resultado_liquido_nota', 0))
             custos = converter_para_float(dados.get('total_custos', 0))
             irrf = converter_para_float(dados.get('irrf', 0))
             data = dados.get('data_pregao', '-')
-            memoria = dados.get('memoria_calculo', '-')
+            raciocinio = dados.get('raciocinio', '-')
             
-            st.success(f"Nota Processada - Data: {data}")
-            st.info(f"🧮 **Memória de Cálculo:** {memoria}")
+            st.success(f"Nota de {data}")
+            st.info(f"👀 **O que a IA viu:** {raciocinio}")
+            
+            # Edição Manual (Caso a IA erre por centavos)
+            with st.expander("📝 Corrigir Valores Manualmente"):
+                col_m1, col_m2, col_m3 = st.columns(3)
+                liq = col_m1.number_input("Líquido Calculado", value=liq, step=1.0)
+                custos = col_m2.number_input("Custos", value=custos, step=0.1)
+                irrf = col_m3.number_input("IRRF", value=irrf, step=0.1)
             
             k1, k2, k3 = st.columns(3)
             cor = "normal" if liq >= 0 else "inverse"
-            k1.metric("Líquido Calculado", f"R$ {liq:,.2f}", delta_color=cor)
+            k1.metric("Líquido Final", f"R$ {liq:,.2f}", delta_color=cor)
             k2.metric("Custos", f"R$ {custos:,.2f}")
             k3.metric("IRRF", f"R$ {irrf:,.2f}")
             
@@ -187,9 +175,6 @@ with aba2:
                 pagar = imposto - irrf
                 if pagar >= 10: st.success(f"### PAGAR DARF: R$ {pagar:,.2f}")
                 elif pagar > 0: st.warning(f"Acumular: R$ {pagar:,.2f}")
-                else: st.success("Isento")
+                else: st.success("Isento (IRRF cobriu)")
             else:
                 st.error(f"Prejuízo a Acumular: R$ {abs(base_calculo):,.2f}")
-            
-            with st.expander("🔍 Ver Texto Bruto"):
-                st.text(texto_debug)

@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import google.generativeai as genai
 import io
-import pdfplumber
 import pypdf
 import json
 import re
@@ -22,6 +21,7 @@ if chave:
 # --- FUNÇÕES ---
 
 def obter_modelo_disponivel():
+    """Busca o modelo disponível"""
     try:
         modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         for m in modelos: 
@@ -38,88 +38,76 @@ def limpar_json(texto):
         return {"erro": "IA não retornou JSON válido."}
     except: return {"erro": "Erro ao processar JSON."}
 
-def extrair_texto_hibrido(arquivo_pdf):
+def extrair_dados_calculadora(arquivo_pdf):
     """
-    Tenta ler com PDFPlumber. Se falhar, tenta com PyPDF.
-    Garante que o texto seja extraído de qualquer jeito.
+    Usa PyPDF (que funciona no seu arquivo) + Prompt de Cálculo Matemático.
     """
-    texto_final = ""
-    metodo_usado = ""
-    
-    # TENTATIVA 1: PDFPlumber (Melhor para tabelas)
+    if not chave: return {"erro": "Chave API não configurada."}, ""
+
     try:
-        with pdfplumber.open(arquivo_pdf) as pdf:
-            for page in pdf.pages:
-                texto_final += page.extract_text() or ""
-        metodo_usado = "PDFPlumber"
-    except:
-        pass
+        # Extração Simples e Direta
+        leitor = pypdf.PdfReader(arquivo_pdf)
+        texto_completo = ""
+        for page in leitor.pages:
+            texto_completo += page.extract_text() + "\n"
         
-    # TENTATIVA 2: PyPDF (Melhor para texto cru) - Fallback
-    if len(texto_final) < 50:
-        try:
-            # Reseta o ponteiro do arquivo para ler do zero
-            arquivo_pdf.seek(0)
-            leitor = pypdf.PdfReader(arquivo_pdf)
-            texto_final = ""
-            for page in leitor.pages:
-                texto_final += page.extract_text() or ""
-            metodo_usado = "PyPDF (Fallback)"
-        except Exception as e:
-            return "", f"Erro em ambos: {str(e)}"
-            
-    return texto_final, metodo_usado
+        # Verificação de Segurança
+        if len(texto_completo) < 50:
+             return {"erro": "O PDF parece ser uma imagem. O PyPDF não encontrou texto selecionável."}, texto_completo
 
-def analisar_nota_ia(texto_completo):
-    if not chave: return {"erro": "Chave API não configurada."}
-    if len(texto_completo) < 50: return {"erro": "Não foi possível ler texto do PDF. O arquivo pode ser imagem."}
-
-    try:
         nome_modelo = obter_modelo_disponivel()
         model = genai.GenerativeModel(nome_modelo)
         
-        # PROMPT ESPECÍFICO PARA SUA NOTA (CM CAPITAL WDO)
+        # PROMPT "CALCULADORA DE AJUSTES"
         prompt = f"""
-        Aja como um contador auditor. Analise o texto desta Nota de Corretagem (CM Capital):
+        Você é um auditor contábil. Analise o texto desta Nota de Corretagem (CM Capital - WDO):
         
         --- TEXTO DA NOTA ---
         {texto_completo[:15000]}
-        --- FIM ---
+        --- FIM DO TEXTO ---
         
-        OBJETIVO: Calcular o Resultado Líquido do Pregão.
+        O campo "Valor dos Negócios" costuma vir zerado nesta corretora. 
+        VOCÊ DEVE CALCULAR O RESULTADO MANUALMENTE.
         
-        INSTRUÇÕES DE RASTREIO:
-        1. Procure pelas linhas que contêm "WDO" ou "WIN" (Futuros).
-        2. Ao lado delas, procure valores com "C" (Crédito) ou "D" (Débito).
-           - Exemplo no texto: "317,87 C" é lucro bruto. "287,87 D" é prejuízo bruto.
-        3. Calcule o AJUSTE DO DIA: (Soma dos Créditos) - (Soma dos Débitos).
-           - Ex: 317,87 - 287,87 = 30,00 Positivo.
-        4. Identifique e some as TAXAS/CUSTOS (Taxa Liq, Registro, Emol, Corretagem, ISS).
-        5. O Resultado Líquido Final é: (Ajuste do Dia) - (Total de Custos).
+        Siga este roteiro de cálculo:
+        1. Encontre as linhas de negociação (WDO/WIN).
+        2. Identifique os AJUSTES DO DIA (Valores seguidos de C ou D).
+           - Some todos os valores com 'C' (Crédito/Ganho).
+           - Some todos os valores com 'D' (Débito/Perda).
+           - Resultado Bruto = (Soma C) - (Soma D).
+           - Exemplo: "317,87 C" e "287,87 D" -> Bruto = +30,00.
+        3. Encontre e some os CUSTOS: (Taxa Liquidação + Registro + Emolumentos + Corretagem + ISS + Outras taxas).
+        4. Resultado Líquido Final = (Resultado Bruto) - (Total Custos).
         
         Retorne JSON:
         {{
             "total_custos": "valor float",
             "irrf": "valor float (se houver)",
-            "resultado_liquido_nota": "valor float (Ajuste - Custos)",
+            "resultado_liquido_nota": "valor float (Resultado Líquido Final calculado)",
             "data_pregao": "DD/MM/AAAA",
-            "logica_usada": "Explique quais valores C e D você encontrou e a conta feita."
+            "memoria_calculo": "Descreva a conta: (Ajuste C - Ajuste D) - Custos"
         }}
         """
         
         response = model.generate_content(prompt)
-        return limpar_json(response.text)
+        return limpar_json(response.text), texto_completo
+        
     except Exception as e:
-        return {"erro": str(e)}
+        return {"erro": str(e)}, ""
 
 def converter_para_float(valor):
     if isinstance(valor, (int, float)): return float(valor)
     try:
         texto = str(valor).strip().upper()
+        # Se a IA já mandou negativo no JSON, respeita.
+        # Se mandou positivo mas com "D", inverte.
         is_negative = 'D' in texto or '-' in texto
         texto = texto.replace('R$', '').replace(' ', '').replace('C', '').replace('D', '')
         if ',' in texto: texto = texto.replace('.', '').replace(',', '.')
         num = float(texto)
+        
+        # Se o numero já é negativo (ex: -30.00), abs(num) tira o sinal.
+        # Lógica: Se tem sinal de menos OU 'D', resultado final deve ser negativo.
         return -abs(num) if is_negative else abs(num)
     except: return 0.0
 
@@ -137,7 +125,7 @@ if not chave:
     st.error("Chave API não configurada.")
     st.stop()
 
-aba1, aba2 = st.tabs(["🏋️‍♂️ Treino", "💰 Contador Híbrido"])
+aba1, aba2 = st.tabs(["🏋️‍♂️ Treino", "💰 Contador"])
 
 with aba1:
     f = st.file_uploader("CSV Profit", type=["csv"])
@@ -159,33 +147,30 @@ with aba1:
                 st.dataframe(df)
 
 with aba2:
-    st.header("Leitor Fiscal (CM Capital)")
+    st.header("Leitor Fiscal (IA Calculadora)")
+    st.info("Especializado em notas de Futuros (WDO/WIN) da CM Capital.")
+    
     c1,c2 = st.columns(2)
-    pdf = c1.file_uploader("Nota PDF", type=["pdf"], key="pdf_hibrido")
+    pdf = c1.file_uploader("Nota PDF", type=["pdf"], key="pdf_calc")
     prej = c2.number_input("Prejuízo Anterior", 0.0, step=10.0)
     
     if pdf:
-        with st.spinner("Motor Híbrido lendo nota..."):
-            # 1. Extrai Texto (Tenta Plumber -> Tenta PyPDF)
-            texto_extraido, metodo = extrair_texto_hibrido(pdf)
-            
-            # 2. Envia para IA
-            dados = analisar_nota_ia(texto_extraido)
+        with st.spinner("Lendo ajustes e calculando custos..."):
+            dados, texto_debug = extrair_dados_calculadora(pdf)
         
         if "erro" in dados:
             st.error(f"Erro: {dados['erro']}")
-            st.warning(f"Método tentado: {metodo}")
-            with st.expander("Ver Texto Extraído (Debug)"):
-                st.text(texto_extraido)
+            with st.expander("Ver Texto (Debug)"):
+                st.text(texto_debug)
         else:
             liq = converter_para_float(dados.get('resultado_liquido_nota', 0))
             custos = converter_para_float(dados.get('total_custos', 0))
             irrf = converter_para_float(dados.get('irrf', 0))
             data = dados.get('data_pregao', '-')
-            logica = dados.get('logica_usada', '-')
+            memoria = dados.get('memoria_calculo', '-')
             
-            st.success(f"Nota Processada ({metodo}) - Data: {data}")
-            st.info(f"🧠 **Lógica da IA:** {logica}")
+            st.success(f"Nota Processada - Data: {data}")
+            st.info(f"🧮 **Memória de Cálculo:** {memoria}")
             
             k1, k2, k3 = st.columns(3)
             cor = "normal" if liq >= 0 else "inverse"
@@ -193,6 +178,7 @@ with aba2:
             k2.metric("Custos", f"R$ {custos:,.2f}")
             k3.metric("IRRF", f"R$ {irrf:,.2f}")
             
+            # Base = (Liquido + IRRF) - Prejuizo
             base_calculo = (liq + irrf) - prej
             
             st.divider()
@@ -205,5 +191,5 @@ with aba2:
             else:
                 st.error(f"Prejuízo a Acumular: R$ {abs(base_calculo):,.2f}")
             
-            with st.expander("Ver Texto Bruto"):
-                st.text(texto_extraido)
+            with st.expander("🔍 Ver Texto Bruto"):
+                st.text(texto_debug)

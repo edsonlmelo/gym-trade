@@ -7,7 +7,7 @@ import re
 import time
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Gym Trade Pro", layout="wide", page_icon="🧩")
+st.set_page_config(page_title="Gym Trade Pro", layout="wide", page_icon="💎")
 
 try:
     chave = st.secrets["GOOGLE_API_KEY"]
@@ -40,121 +40,98 @@ def limpar_json(texto):
         return {"erro": "Erro no JSON"}
     except: return {"erro": "Erro JSON"}
 
-# --- CÉREBRO: ESCOLHA AUTOMÁTICA DE MODELO ---
-@st.cache_resource
-def selecionar_melhor_modelo():
-    """
-    Varre a conta do usuário e escolhe o melhor modelo disponível.
-    Prioriza modelos 'latest' e 'flash' para evitar erro 404 e cotas baixas.
-    """
-    if not chave: return None
-    
-    try:
-        # Pega a lista real do Google
-        todos_modelos = list(genai.list_models())
-        nomes = [m.name for m in todos_modelos if 'generateContent' in m.supported_generation_methods]
-        
-        # Ordem de preferência (do maior limite para o menor)
-        preferencias = [
-            "models/gemini-flash-latest",       # Geralmente limites altos
-            "models/gemini-1.5-flash-latest",
-            "models/gemini-1.5-flash",
-            "models/gemini-1.5-flash-001",
-            "models/gemini-2.0-flash",          # Bom, mas novo
-            "models/gemini-2.0-flash-exp",
-            "models/gemini-flash",              # Genérico
-        ]
-        
-        # Tenta achar o preferido na lista do usuário
-        for pref in preferencias:
-            if pref in nomes:
-                return pref
-        
-        # Se não achar nenhum específico, pega qualquer um que tenha 'flash'
-        for nome in nomes:
-            if 'flash' in nome:
-                return nome
-                
-        # Se não tiver flash, pega o primeiro da lista (ex: pro)
-        if nomes:
-            return nomes[0]
+# --- MOTOR DE IA (LISTA DE ELITE) ---
+def chamar_ia_elite(prompt, parts=None):
+    if not chave: return {"erro": "API Key não configurada."}
+
+    # SUA LISTA DE PREFERÊNCIA (Do melhor para o "backup")
+    modelos_elite = [
+        "models/gemini-2.0-flash",       # Sua preferência #1
+        "models/gemini-2.0-flash-exp",   # Sua preferência #2
+        "models/gemini-1.5-pro",         # Mais potente
+        "models/gemini-1.5-flash"        # Último recurso
+    ]
+
+    erro_final = ""
+
+    for modelo in modelos_elite:
+        try:
+            ia = genai.GenerativeModel(modelo)
             
-        return None
-    except Exception as e:
-        return None
+            if parts:
+                response = ia.generate_content([prompt, parts])
+            else:
+                response = ia.generate_content(prompt)
+                
+            # Se chegou aqui, funcionou! Retorna o texto e o modelo usado.
+            return {"texto": response.text, "modelo": modelo}
+            
+        except Exception as e:
+            # Se der erro (404, 429), guarda o erro e tenta o próximo da lista
+            erro_final = str(e)
+            continue
+    
+    # Se todos falharem
+    return {"erro": f"Todos os modelos falharam. Último erro: {erro_final}"}
 
 # --- COACH ---
 def chamar_coach(texto_usuario):
-    modelo_nome = selecionar_melhor_modelo()
-    if not modelo_nome: return "Erro: Nenhum modelo de IA encontrado na sua conta."
+    resultado = chamar_ia_elite(f"Aja como um Coach Trader experiente, curto e grosso. Analise: {texto_usuario}")
     
-    try:
-        ia = genai.GenerativeModel(modelo_nome)
-        resp = ia.generate_content(f"Aja como um Coach Trader experiente e breve. Analise: {texto_usuario}")
-        return resp.text
-    except Exception as e:
-        if "429" in str(e): return "⏳ Cota excedida. Aguarde 1 min."
-        return f"Erro técnico: {str(e)}"
+    if "erro" in resultado:
+        return f"Erro no Coach: {resultado['erro']}"
+    return resultado["texto"]
 
 # --- LEITOR DE NOTA ---
-def ler_nota_corretagem(arquivo_pdf):
-    modelo_nome = selecionar_melhor_modelo()
-    if not modelo_nome: return {"erro": "Erro de conexão com Google AI (ListModels falhou)."}
+@st.cache_data(show_spinner=False)
+def ler_nota_corretagem(arquivo_bytes):
+    part = {"mime_type": "application/pdf", "data": arquivo_bytes}
 
-    try:
-        bytes_pdf = arquivo_pdf.getvalue()
-        part = {"mime_type": "application/pdf", "data": bytes_pdf}
-
-        prompt = """
-        Analise esta Nota de Corretagem (Brasil).
-        
-        EXTRAIA VALORES PARA IMPOSTO DE RENDA:
-        
-        1. "valor_negocios_explicito":
-           - Procure campos: "Valor dos Negócios", "Total Líquido", "Ajuste Day Trade".
-           - Exemplo CM Capital: Pode estar no meio da nota (Ex: 30,00 C).
-           - Exemplo Clear: Geralmente no topo.
-           - Se 'C' = positivo, se 'D' = negativo.
-        
-        2. "custos_totais":
-           - Vá ao rodapé. Some TODAS as taxas (Liq + Reg + Emol + Corr + ISS).
-        
-        3. "irrf": Valor do I.R.R.F.
-        
-        4. "soma_creditos" e "soma_debitos":
-           - Caso não ache valor explícito, some os ajustes C e D da tabela.
-        
-        Retorne JSON:
-        {
-            "valor_negocios_explicito": "0.00",
-            "custos_totais": "0.00",
-            "irrf": "0.00",
-            "soma_creditos": "0.00",
-            "soma_debitos": "0.00",
-            "data": "DD/MM/AAAA",
-            "corretora": "Nome"
-        }
-        """
-        
-        ia = genai.GenerativeModel(modelo_nome)
-        resp = ia.generate_content([prompt, part])
-        dados = limpar_json(resp.text)
-        dados['modelo_usado'] = modelo_nome # Para sabermos qual ele escolheu
-        return dados
-        
-    except Exception as e:
-        if "429" in str(e): return {"erro": "⏳ Muitos pedidos seguidos. O Google bloqueou temporariamente. Espere 1 minuto."}
-        return {"erro": f"Erro técnico ({modelo_nome}): {str(e)}"}
+    prompt = """
+    Analise a Nota de Corretagem (Brasil).
+    
+    EXTRAIA VALORES PARA IMPOSTO DE RENDA:
+    
+    1. "valor_negocios_explicito":
+       - Procure: "Valor dos Negócios", "Total Líquido", "Ajuste Day Trade".
+       - ATENÇÃO: Na CM Capital, pode estar solto no meio da página (ex: 30,00 C).
+       - Se tiver 'C' = Positivo, 'D' = Negativo.
+    
+    2. "custos_totais":
+       - Rodapé. Some TODAS as taxas: Liq + Reg + Emol + Corr + ISS.
+    
+    3. "irrf": Valor do I.R.R.F.
+    
+    4. "soma_creditos" e "soma_debitos":
+       - Some ajustes C e D da tabela de negócios (Caso precise calcular).
+    
+    Retorne JSON:
+    {
+        "valor_negocios_explicito": "0.00",
+        "custos_totais": "0.00",
+        "irrf": "0.00",
+        "soma_creditos": "0.00",
+        "soma_debitos": "0.00",
+        "data": "DD/MM/AAAA",
+        "corretora": "Nome"
+    }
+    """
+    
+    resultado = chamar_ia_elite(prompt, part)
+    
+    if "erro" in resultado:
+        return {"erro": resultado["erro"]}
+    
+    dados = limpar_json(resultado["texto"])
+    dados["modelo_usado"] = resultado.get("modelo", "Desconhecido")
+    return dados
 
 # --- INTERFACE ---
-st.title("🎯 Gym Trade Pro")
+st.title("💎 Gym Trade Pro (Elite 2.0)")
 
-# Mostra qual modelo foi escolhido automaticamente
-modelo_ativo = selecionar_melhor_modelo()
-if modelo_ativo:
-    st.caption(f"✅ Conectado via: `{modelo_ativo}`")
-else:
-    st.error("❌ Erro: Não foi possível selecionar um modelo de IA.")
+if not chave:
+    st.error("❌ Configure a API Key")
+    st.stop()
 
 aba_treino, aba_contador = st.tabs(["📊 Profit & Coach", "📝 Nota Fiscal"])
 
@@ -166,33 +143,34 @@ with aba_treino:
             s = up.getvalue().decode('latin1').split('\n')
             i = next((x for x, l in enumerate(s) if "Ativo" in l and ";" in l), 0)
             df = pd.read_csv(io.StringIO('\n'.join(s[i:])), sep=';', encoding='latin1')
+            
             col = next((c for c in df.columns if ('Res' in c or 'Lucro' in c) and ('Op' in c or 'Liq' in c)), None)
+            
             if col:
                 df['V'] = df[col].apply(converter_para_float)
                 total = df['V'].sum()
                 trades = len(df)
+                
                 c1, c2 = st.columns(2)
                 c1.metric("Resultado", formatar_real(total))
                 c2.metric("Trades", trades)
                 
-                if st.button("🧠 Coach"):
+                if st.button("🧠 Chamar Coach"):
                     with st.spinner("Analisando..."):
                         msg = chamar_coach(f"Fiz {formatar_real(total)} em {trades} operações.")
-                        if "⏳" in msg: st.warning(msg)
-                        elif "Erro" in msg: st.error(msg)
-                        else: st.info(f"💡 {msg}")
+                        st.info(f"💡 {msg}")
                 st.dataframe(df)
         except Exception as e: st.error(f"Erro CSV: {e}")
 
 # ABA 2
 with aba_contador:
-    st.info("Leitor Universal Inteligente")
+    st.info("Prioridade de IA: Gemini 2.0 Flash > 1.5 Pro")
     pdf = st.file_uploader("Nota PDF", type=["pdf"])
     prejuizo = st.number_input("Prejuízo Anterior", 0.0, step=10.0)
     
     if pdf:
-        with st.spinner("Lendo Nota..."):
-            d = ler_nota_corretagem(pdf)
+        with st.spinner("Processando Nota..."):
+            d = ler_nota_corretagem(pdf.getvalue())
         
         if "erro" in d:
             st.error(f"❌ {d['erro']}")
@@ -205,7 +183,7 @@ with aba_contador:
             data = d.get('data', '-')
             modelo = d.get('modelo_usado', '?')
             
-            # Prioridade: Valor Explícito > Cálculo
+            # Lógica Híbrida: Prioriza valor explícito > cálculo
             if abs(vlr_negocios) > 0.01:
                 bruto = vlr_negocios
                 fonte = "Campo 'Valor dos Negócios'"
@@ -216,10 +194,10 @@ with aba_contador:
             liq_op = bruto - abs(custos)
             base = liq_op - prejuizo
             
-            st.success(f"Nota Processada: {data} (Via {modelo})")
+            st.success(f"Nota Processada: {data} (Usando {modelo})")
             
             k1, k2, k3 = st.columns(3)
-            k1.metric("Bruto (Ajuste)", formatar_real(bruto))
+            k1.metric("Bruto (Ajuste)", formatar_real(bruto), help=fonte)
             k2.metric("Custos", formatar_real(custos))
             k3.metric("Líquido Op.", formatar_real(liq_op))
             

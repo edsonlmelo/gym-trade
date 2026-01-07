@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import google.generativeai as genai
 import io
-import pypdf
+import pdfplumber
 import json
 import re
 
@@ -19,9 +19,8 @@ if chave:
     genai.configure(api_key=chave)
 
 # --- FUNÇÕES ---
-
 def obter_modelo_disponivel():
-    """Tenta usar o Flash (rápido), se não der, usa o Pro"""
+    """Busca o modelo disponível"""
     try:
         modelos = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         for m in modelos: 
@@ -29,23 +28,6 @@ def obter_modelo_disponivel():
         return 'models/gemini-1.5-flash'
     except:
         return 'models/gemini-1.5-flash'
-
-def converter_para_float(valor):
-    """Limpa texto financeiro (R$ 1.000,00 D -> -1000.00)"""
-    if isinstance(valor, (int, float)): return float(valor)
-    try:
-        texto = str(valor).strip().upper()
-        # Detecta se é negativo (D de Débito ou sinal de menos)
-        is_negative = 'D' in texto or '-' in texto
-        
-        texto = texto.replace('R$', '').replace(' ', '').replace('C', '').replace('D', '')
-        if ',' in texto:
-            texto = texto.replace('.', '').replace(',', '.') # Padrão BR
-            
-        numero = float(texto)
-        return -abs(numero) if is_negative else abs(numero)
-    except:
-        return 0.0
 
 def limpar_json(texto):
     try:
@@ -55,52 +37,70 @@ def limpar_json(texto):
         return {"erro": "IA não retornou JSON válido."}
     except: return {"erro": "Erro ao processar JSON."}
 
-def extrair_dados_pdf(arquivo_pdf):
-    if not chave: return {"erro": "Chave API não configurada."}
+def extrair_dados_pdf_plumber(arquivo_pdf):
+    if not chave: return {"erro": "Chave API não configurada."}, ""
 
     try:
-        leitor = pypdf.PdfReader(arquivo_pdf)
-        texto = ""
-        for p in leitor.pages: texto += p.extract_text() + "\n"
+        texto_completo = ""
+        # Usa pdfplumber para extração robusta
+        with pdfplumber.open(arquivo_pdf) as pdf:
+            for page in pdf.pages:
+                texto_completo += page.extract_text() + "\n"
         
+        if len(texto_completo) < 50:
+             return {"erro": "O PDF parece vazio ou é uma imagem. Tente 'Imprimir como PDF' novamente."}, texto_completo
+
         nome_modelo = obter_modelo_disponivel()
         model = genai.GenerativeModel(nome_modelo)
         
-        # PROMPT REFORÇADO PARA CM CAPITAL / FUTUROS
+        # PROMPT ESPECÍFICO PARA CM CAPITAL / FUTUROS
         prompt = f"""
-        Aja como um contador perito em Notas de Corretagem de Futuros (WDO/WIN).
-        Analise o texto extraído desta nota (provável CM Capital):
+        Você é um auditor contábil perito em B3.
+        Analise o texto cru desta Nota de Corretagem (CM Capital/Sinacor):
         
-        --- TEXTO DA NOTA ---
-        {texto[:20000]}
+        --- INÍCIO DO TEXTO ---
+        {texto_completo[:15000]}
         --- FIM DO TEXTO ---
         
-        Sua missão é extrair os valores REAIS do dia, ignorando saldos anteriores.
+        Sua missão é calcular o RESULTADO LÍQUIDO DO DIA (Day Trade).
         
-        Raciocínio Obrigatório:
-        1. Identifique os custos operacionais (Taxa Liquidação + Registro + Emolumentos + Corretagem + ISS). Some tudo em "total_custos".
-        2. Identifique o IRRF (Imposto de Renda Retido / Dedo-duro).
-        3. Para o "resultado_liquido_nota":
-           - Em notas de WDO/WIN, procure o bloco "Resumo Financeiro" ou "Resumo dos Negócios".
-           - O resultado do dia geralmente é a soma de "Ajuste de Posição" ou "Total Líquido".
-           - IMPORTANTE: NÃO CONFUNDA COM "SALDO EM C/C" ou "TOTAL CONTA INVESTIMENTO". Quero apenas o resultado das operações DO DIA menos os custos.
-           - Dica: Se houver operações de compra e venda com "Ajuste" (Ex: 317,87 C e 287,87 D), o bruto é a diferença (30,00 C). Subtraia os custos disso.
-           - Se o valor tiver "D" é Débito (Negativo). Se tiver "C" é Crédito (Positivo).
+        Regras de Cálculo (Siga passo a passo):
+        1. Identifique operações de Futuros (WDO/WIN).
+        2. Para cada operação, ignore o preço de abertura. Olhe apenas os AJUSTES.
+           - Valores com 'C' são Créditos (Positivos).
+           - Valores com 'D' são Débitos (Negativos).
+           - Exemplo: 317,87 C e 287,87 D resulta em (+317.87 - 287.87) = +30.00.
+        3. Identifique os CUSTOS (Taxas B3 + Corretagem + ISS).
+        4. O 'resultado_liquido_nota' deve ser: (Soma dos Ajustes) - (Total de Custos).
+           - NÃO use o valor de "Valor dos Negócios" se estiver zerado.
+           - NÃO use saldo de conta corrente.
         
-        Retorne APENAS um JSON neste formato:
+        Retorne APENAS um JSON:
         {{
-            "total_custos": "0.00",
-            "irrf": "0.00",
-            "resultado_liquido_nota": "0.00",
+            "total_custos": "Valor total das taxas (float)",
+            "irrf": "Valor do IRRF (float)",
+            "resultado_liquido_nota": "Valor calculado do lucro/prejuízo liquido (float)",
             "data_pregao": "DD/MM/AAAA",
-            "raciocinio_ia": "Explique em 1 frase curta como chegou no valor liquido."
+            "explicação": "Uma frase curta explicando a conta que você fez (ex: Ajuste 317C - 287D - taxas)"
         }}
         """
         
         response = model.generate_content(prompt)
-        return limpar_json(response.text)
+        return limpar_json(response.text), texto_completo
+        
     except Exception as e:
-        return {"erro": str(e)}
+        return {"erro": str(e)}, ""
+
+def converter_para_float(valor):
+    if isinstance(valor, (int, float)): return float(valor)
+    try:
+        texto = str(valor).strip().upper()
+        is_negative = 'D' in texto or '-' in texto
+        texto = texto.replace('R$', '').replace(' ', '').replace('C', '').replace('D', '')
+        if ',' in texto: texto = texto.replace('.', '').replace(',', '.')
+        num = float(texto)
+        return -abs(num) if is_negative else abs(num)
+    except: return 0.0
 
 def carregar_csv_blindado(f):
     try:
@@ -113,12 +113,11 @@ def carregar_csv_blindado(f):
 st.title("📈 Gym Trade Pro")
 
 if not chave:
-    st.error("Chave API ausente.")
+    st.error("Chave API não configurada.")
     st.stop()
 
-aba1, aba2 = st.tabs(["🏋️‍♂️ Treino", "💰 Contador Inteligente"])
+aba1, aba2 = st.tabs(["🏋️‍♂️ Treino", "💰 Contador (PDF)"])
 
-# --- ABA 1 (Mantida igual) ---
 with aba1:
     f = st.file_uploader("CSV Profit", type=["csv"])
     if f:
@@ -134,68 +133,55 @@ with aba1:
                 c2.metric("Trades", trd)
                 if st.button("Coach"):
                     n = obter_modelo_disponivel()
-                    msg = genai.GenerativeModel(n).generate_content(f"Trader: R$ {res} em {trd} trades. Feedback.").text
+                    msg = genai.GenerativeModel(n).generate_content(f"Trader: R$ {res:.2f}, {trd} trades. Feedback.").text
                     st.info(msg)
                 st.dataframe(df)
 
-# --- ABA 2 (Melhorada) ---
 with aba2:
-    st.header("Leitor de Nota (CM Capital / WDO)")
+    st.header("Leitor Fiscal (PDF)")
     c1,c2 = st.columns(2)
-    pdf = c1.file_uploader("Nota PDF", type=["pdf"])
+    # Importante: seek(0) é feito internamente pelo pdfplumber, mas garantimos refresh
+    pdf = c1.file_uploader("Nota PDF", type=["pdf"], key="pdf_up")
     prej = c2.number_input("Prejuízo Anterior", 0.0, step=10.0)
     
     if pdf:
-        with st.spinner("Contador IA analisando cada linha..."):
-            d = extrair_dados_pdf(pdf)
+        with st.spinner("Extraindo dados com PDFPlumber..."):
+            dados, texto_debug = extrair_dados_pdf_plumber(pdf)
         
-        if "erro" in d:
-            st.error(f"Erro: {d['erro']}")
+        if "erro" in dados:
+            st.error(f"Erro: {dados['erro']}")
+            with st.expander("🛠️ Ver Texto Lido (Debug)"):
+                st.text(texto_debug)
         else:
-            # Extração
-            liq = converter_para_float(d.get('resultado_liquido_nota', 0))
-            custos = converter_para_float(d.get('total_custos', 0))
-            irrf = converter_para_float(d.get('irrf', 0))
-            data = d.get('data_pregao', '-')
-            raciocinio = d.get('raciocinio_ia', 'Sem explicação')
+            liq = converter_para_float(dados.get('resultado_liquido_nota', 0))
+            custos = converter_para_float(dados.get('total_custos', 0))
+            irrf = converter_para_float(dados.get('irrf', 0))
+            data = dados.get('data_pregao', '-')
+            explicacao = dados.get('explicação', '-')
             
-            st.success(f"Nota Processada! Data: {data}")
+            st.success(f"Nota de {data}")
+            st.info(f"🧠 **Raciocínio da IA:** {explicacao}")
             
-            # Mostra o raciocínio para validarmos
-            with st.expander("🤖 Ver como a IA calculou (Clique aqui se o valor estiver estranho)"):
-                st.write(f"**Explicação da IA:** {raciocinio}")
-            
-            # Cards
             k1, k2, k3 = st.columns(3)
-            cor_liq = "normal" if liq >= 0 else "inverse"
-            k1.metric("Líquido do Dia", f"R$ {liq:,.2f}", delta_color=cor_liq)
+            cor = "normal" if liq >= 0 else "inverse"
+            k1.metric("Líquido Calculado", f"R$ {liq:,.2f}", delta_color=cor)
             k2.metric("Custos", f"R$ {custos:,.2f}")
             k3.metric("IRRF", f"R$ {irrf:,.2f}")
             
-            # Lógica Fiscal (Dedo-duro já abate do imposto)
-            # Bruto Operacional = Liquido + Custos + IRRF
-            bruto = liq + custos + irrf
-            
-            # Base = (Bruto - Custos) - Prejuizo
-            # Simplificando: (Liquido + IRRF) - Prejuizo
+            # Cálculo Imposto
+            # Base = (Líquido + IRRF) - Prejuizo
+            # (Porque o liquido já descontou taxas, mas o IRRF faz parte do lucro tributável antes de ser abatido no fim)
             base_calculo = (liq + irrf) - prej
             
             st.divider()
-            st.subheader("🧮 Apuração de Imposto")
-            
             if base_calculo > 0:
                 imposto = base_calculo * 0.20
                 pagar = imposto - irrf
-                
-                if pagar >= 10:
-                    st.success(f"### 📄 DARF A PAGAR: R$ {pagar:,.2f}")
-                    st.write(f"(Base R$ {base_calculo:.2f} x 20%) - IRRF R$ {irrf:.2f}")
-                elif pagar > 0:
-                    st.info(f"### Acumular: R$ {pagar:,.2f}")
-                    st.caption("DARF < R$ 10,00. Não pague agora, acumule.")
-                else:
-                    st.success("### Isento (IRRF cobriu)")
+                if pagar >= 10: st.success(f"### PAGAR DARF: R$ {pagar:,.2f}")
+                elif pagar > 0: st.warning(f"Acumular: R$ {pagar:,.2f}")
+                else: st.success("Isento")
             else:
-                novo_prej = abs(base_calculo)
-                st.error(f"### 📉 Prejuízo a Acumular: R$ {novo_prej:,.2f}")
-                st.caption("Use este valor no campo 'Prejuízo Anterior' mês que vem.")
+                st.error(f"Prejuízo a Acumular: R$ {abs(base_calculo):,.2f}")
+
+            with st.expander("🔍 Ver Texto Bruto da Nota"):
+                st.text(texto_debug)

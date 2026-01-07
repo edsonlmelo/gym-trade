@@ -5,11 +5,11 @@ import io
 import json
 import re
 import time
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, RetryError
 from google.api_core.exceptions import ResourceExhausted, InternalServerError, ServiceUnavailable
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Gym Trade Pro", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="Gym Trade Pro", layout="wide", page_icon="🧘")
 
 try:
     chave = st.secrets["GOOGLE_API_KEY"]
@@ -39,20 +39,19 @@ def limpar_json(texto):
     try:
         match = re.search(r'\{.*\}', texto, re.DOTALL)
         if match: return json.loads(match.group(0))
-        return {"erro": "Erro no JSON retornado pela IA"}
+        return {"erro": "A IA não retornou os dados no formato correto."}
     except: return {"erro": "Erro ao converter resposta para JSON"}
 
-# --- MOTOR DE IA BLINDADO (RETRY AUTOMÁTICO) ---
+# --- MOTOR DE IA (COM TRATAMENTO DE COTA) ---
 
-# Esta função tenta até 5 vezes se der erro de Cota (429) ou Servidor (500)
-# Espera: 2s, 4s, 8s, 16s... (Exponencial)
 @retry(
     retry=retry_if_exception_type((ResourceExhausted, InternalServerError, ServiceUnavailable)),
-    wait=wait_exponential(multiplier=2, min=4, max=60),
-    stop=stop_after_attempt(5)
+    wait=wait_exponential(multiplier=2, min=4, max=20), # Espera progressiva: 4s, 8s, 16s...
+    stop=stop_after_attempt(3) # Tenta no máximo 3 vezes para não travar o app
 )
-def chamar_gemini_com_retry(modelo_nome, prompt, parts=None):
-    model = genai.GenerativeModel(modelo_nome)
+def chamar_gemini_direto(prompt, parts=None):
+    # Prioridade total ao 2.0 Flash como você pediu
+    model = genai.GenerativeModel("models/gemini-2.0-flash") 
     if parts:
         response = model.generate_content([prompt, parts])
     else:
@@ -60,39 +59,37 @@ def chamar_gemini_com_retry(modelo_nome, prompt, parts=None):
     return response.text
 
 def executar_ia_segura(prompt, parts=None):
-    """
-    Tenta o Gemini 2.0. Se der erro de NOME (404), tenta o 1.5.
-    Se der erro de COTA (429), o @retry acima resolve.
-    """
-    if not chave: return {"erro": "Sem API Key"}
+    if not chave: return {"erro": "API Key não configurada."}
 
-    # Lista de prioridade (Hardcoded para economizar cota de listagem)
-    modelos = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+    try:
+        texto_resp = chamar_gemini_direto(prompt, parts)
+        return {"texto": texto_resp, "modelo": "Gemini 2.0 Flash"}
     
-    ultimo_erro = ""
-
-    for modelo in modelos:
-        try:
-            texto_resp = chamar_gemini_com_retry(modelo, prompt, parts)
-            return {"texto": texto_resp, "modelo": modelo}
-        except Exception as e:
-            # Se o erro for 429, o retry já tentou 5 vezes e falhou.
-            # Se for 404 (Model not found), passamos para o próximo da lista.
-            if "404" in str(e) or "not found" in str(e).lower():
-                continue
-            ultimo_erro = str(e)
-            
-    return {"erro": f"Falha após tentativas. Erro: {ultimo_erro}"}
+    except RetryError as e:
+        # Captura o erro da biblioteca Tenacity (Esgotou tentativas)
+        return {"erro": "🚦 Cota de IA excedida temporariamente. Aguarde 30 segundos e tente novamente."}
+    except Exception as e:
+        # Outros erros (404, etc)
+        if "404" in str(e):
+             # Fallback de emergência se o 2.0 sumir
+             try:
+                 model_bkp = genai.GenerativeModel("models/gemini-1.5-flash")
+                 if parts: resp = model_bkp.generate_content([prompt, parts])
+                 else: resp = model_bkp.generate_content(prompt)
+                 return {"texto": resp.text, "modelo": "Gemini 1.5 Flash (Backup)"}
+             except:
+                 return {"erro": "Erro técnico 404: Modelo não encontrado na conta."}
+        
+        return {"erro": f"Erro técnico: {str(e)}"}
 
 # --- COACH ---
 def chamar_coach(texto_usuario):
-    resultado = executar_ia_segura(f"Aja como um Coach Trader experiente e direto. Resuma: {texto_usuario}")
-    if "erro" in resultado:
-        return f"Erro no Coach: {resultado['erro']}"
-    return resultado["texto"]
+    res = executar_ia_segura(f"Aja como um Coach Trader experiente e breve. Analise: {texto_usuario}")
+    if "erro" in res:
+        return f"⚠️ {res['erro']}"
+    return res["texto"]
 
-# --- LEITOR DE NOTA (COM CACHE) ---
-# Cache: Se você subir o mesmo PDF, ele não gasta cota de novo!
+# --- LEITOR DE NOTA (CACHEADO) ---
 @st.cache_data(show_spinner=False) 
 def ler_nota_corretagem(arquivo_bytes):
     part = {"mime_type": "application/pdf", "data": arquivo_bytes}
@@ -103,13 +100,13 @@ def ler_nota_corretagem(arquivo_bytes):
     EXTRAIA VALORES EXATOS PARA IR (DAY TRADE):
     
     1. "valor_negocios_explicito":
-       - Procure campos: "Valor dos Negócios", "Total Líquido", "Ajuste Day Trade".
-       - ATENÇÃO: Na CM Capital, procure no CORPO da nota (Ex: 30,00 C).
-       - Na Clear/XP: Geralmente no cabeçalho ou resumo.
+       - Procure: "Valor dos Negócios", "Total Líquido", "Ajuste Day Trade".
+       - ATENÇÃO: Na CM Capital, procure no CORPO/MEIO da nota (Ex: 30,00 C).
+       - Na Clear/XP: Geralmente no topo.
        - 'C' = Positivo, 'D' = Negativo.
     
     2. "custos_totais":
-       - Vá ao rodapé. Some TODAS as taxas (Liq + Reg + Emol + Corr + ISS).
+       - Rodapé. Some TODAS as taxas: Taxa Operacional + Registro + Emolumentos + Corretagem + ISS.
     
     3. "irrf": Valor do I.R.R.F.
     
@@ -138,7 +135,7 @@ def ler_nota_corretagem(arquivo_bytes):
     return dados
 
 # --- INTERFACE ---
-st.title("🛡️ Gym Trade Pro (Versão Blindada)")
+st.title("🛡️ Gym Trade Pro")
 
 aba_treino, aba_contador = st.tabs(["📊 Profit & Coach", "📝 Nota Fiscal"])
 
@@ -163,10 +160,10 @@ with aba_treino:
                 c2.metric("Trades", trades)
                 
                 if st.button("🧠 Coach"):
-                    with st.spinner("Analisando (Pode demorar se a cota estiver cheia)..."):
+                    with st.spinner("Analisando..."):
                         msg = chamar_coach(f"Fiz {formatar_real(total)} em {trades} operações.")
-                        if "Erro" in msg:
-                            st.error(msg)
+                        if "⚠️" in msg or "Erro" in msg:
+                            st.warning(msg)
                         else:
                             st.info(f"💡 {msg}")
                 st.dataframe(df)
@@ -174,12 +171,13 @@ with aba_treino:
 
 # ABA 2
 with aba_contador:
-    st.info("Suporta: Clear, CM Capital (R$ 30,00 C), XP, etc.")
+    st.info("Leitor Universal (Prioridade: Gemini 2.0)")
     pdf = st.file_uploader("Nota PDF", type=["pdf"])
     prejuizo = st.number_input("Prejuízo Anterior", 0.0, step=10.0)
     
     if pdf:
-        with st.spinner("Processando... (Se demorar, estou aguardando liberação do Google)"):
+        # Verificamos cache para não gastar cota à toa
+        with st.spinner("Processando Nota..."):
             d = ler_nota_corretagem(pdf.getvalue())
         
         if "erro" in d:
@@ -193,10 +191,10 @@ with aba_contador:
             data = d.get('data', '-')
             modelo = d.get('modelo_usado', '?')
             
-            # Lógica Híbrida: Prioriza valor explícito > cálculo
+            # Lógica Híbrida Inteligente
             if abs(vlr_negocios) > 0.01:
                 bruto = vlr_negocios
-                fonte = "Valor Explícito na Nota"
+                fonte = "Campo 'Valor dos Negócios' (Nota)"
             else:
                 bruto = abs(creditos) - abs(debitos)
                 fonte = "Cálculo (C - D)"

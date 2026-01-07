@@ -19,29 +19,6 @@ if chave:
 
 # --- FUNÇÕES ---
 
-def obter_modelo_disponivel():
-    """
-    Lista os modelos reais disponíveis na sua conta e retorna o nome exato.
-    Isso evita o erro 404 de nome incorreto.
-    """
-    try:
-        modelos_disponiveis = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                modelos_disponiveis.append(m.name)
-        
-        # Procura variações do Flash (ex: gemini-1.5-flash-latest, gemini-1.5-flash-001)
-        for m in modelos_disponiveis:
-            if 'flash' in m and '1.5' in m: return m
-            
-        # Se não achar, tenta o Pro
-        for m in modelos_disponiveis:
-            if 'pro' in m and '1.5' in m: return m
-            
-        return 'models/gemini-1.5-flash' # Fallback final
-    except:
-        return 'models/gemini-1.5-flash'
-
 def limpar_json(texto):
     try:
         padrao = r'\{.*\}'
@@ -50,54 +27,66 @@ def limpar_json(texto):
         return {"erro": "IA não retornou JSON válido."}
     except: return {"erro": "Erro ao processar JSON."}
 
-def analisar_pdf_visao(arquivo_pdf):
+def analisar_pdf_com_tentativas(arquivo_pdf):
     if not chave: return {"erro": "Chave API não configurada."}
 
-    try:
-        # Busca o nome exato do modelo (para evitar erro 404)
-        nome_modelo = obter_modelo_disponivel()
-        
-        # Cria o modelo
-        model = genai.GenerativeModel(nome_modelo)
-        
-        prompt = """
-        Você é um Auditor Contábil. Analise visualmente esta Nota de Corretagem (PDF).
-        
-        Sua missão: CALCULAR O RESULTADO LÍQUIDO DE DAY TRADE (WDO/WIN).
-        
-        Roteiro de Análise Visual:
-        1. Ignore o campo "Valor dos Negócios" se estiver zerado.
-        2. Olhe coluna por coluna nas operações.
-        3. Identifique os AJUSTES:
-           - Valores com 'C' são Créditos (Positivos).
-           - Valores com 'D' são Débitos (Negativos).
-           - SOMATÓRIA BRUTA = (Soma dos C) - (Soma dos D).
-        4. Identifique o bloco de CUSTOS/DESPESAS no rodapé (Taxas, Emolumentos, Corretagem, ISS). Some tudo.
-        5. LÍQUIDO FINAL = SOMATÓRIA BRUTA - CUSTOS TOTAIS.
-        
-        Retorne JSON:
-        {
-            "modelo_usado": "Retorne o nome do modelo que você é",
-            "total_custos": 0.00,
-            "irrf": 0.00,
-            "resultado_liquido_nota": 0.00,
-            "data_pregao": "DD/MM/AAAA",
-            "raciocinio": "Vi ajustes de X (C) e Y (D). A diferença é Z. Subtraí custos."
-        }
-        """
-        
-        # Envia arquivo + prompt
-        bytes_pdf = arquivo_pdf.getvalue()
-        part_arquivo = {"mime_type": "application/pdf", "data": bytes_pdf}
-        
-        response = model.generate_content([prompt, part_arquivo])
-        
-        dados = limpar_json(response.text)
-        dados['modelo_debug'] = nome_modelo # Adiciona info de debug
-        return dados
-        
-    except Exception as e:
-        return {"erro": f"Erro técnico ({nome_modelo}): {str(e)}"}
+    # Lista de nomes para tentar (Força Bruta)
+    # Tenta um por um até funcionar
+    candidatos = [
+        "gemini-1.5-flash",          # Nome padrão
+        "gemini-1.5-flash-latest",   # Variação comum
+        "gemini-1.5-flash-001",      # Versão específica
+        "gemini-1.5-pro",            # Alternativa mais potente
+        "gemini-1.5-pro-latest"
+    ]
+    
+    bytes_pdf = arquivo_pdf.getvalue()
+    part_arquivo = {"mime_type": "application/pdf", "data": bytes_pdf}
+
+    prompt = """
+    Você é um Auditor Contábil (B3). Analise visualmente esta Nota de Corretagem (PDF).
+    
+    MISSÃO: Calcular o Resultado Líquido de Day Trade (WDO/WIN).
+    
+    1. Ignore "Valor dos Negócios" se zerado.
+    2. Identifique os AJUSTES na tabela de negócios:
+       - Valores com 'C' são Créditos (+).
+       - Valores com 'D' são Débitos (-).
+       - Somatória Bruta = (Soma C) - (Soma D).
+    3. Identifique e some os CUSTOS no rodapé (Taxas, Emolumentos, Corretagem, ISS).
+    4. Líquido Final = Somatória Bruta - Custos Totais.
+    
+    Retorne JSON:
+    {
+        "modelo_usado": "Nome do modelo aqui",
+        "total_custos": 0.00,
+        "irrf": 0.00,
+        "resultado_liquido_nota": 0.00,
+        "data_pregao": "DD/MM/AAAA",
+        "raciocinio": "Vi ajustes C e D. Diferença X. Menos custos Y."
+    }
+    """
+
+    ultimo_erro = ""
+
+    # LOOP DE TENTATIVAS
+    for nome_modelo in candidatos:
+        try:
+            model = genai.GenerativeModel(nome_modelo)
+            response = model.generate_content([prompt, part_arquivo])
+            
+            # Se chegou aqui, funcionou!
+            dados = limpar_json(response.text)
+            dados['modelo_sucesso'] = nome_modelo # Marca qual funcionou
+            return dados
+            
+        except Exception as e:
+            # Se der erro, guarda a mensagem e tenta o próximo da lista
+            ultimo_erro = str(e)
+            continue
+    
+    # Se sair do loop, todos falharam
+    return {"erro": f"Todos os modelos falharam. Último erro: {ultimo_erro}"}
 
 def converter_para_float(valor):
     if isinstance(valor, (int, float)): return float(valor)
@@ -124,7 +113,8 @@ if not chave:
     st.error("Chave API não configurada.")
     st.stop()
 
-aba1, aba2 = st.tabs(["🏋️‍♂️ Treino", "💰 Contador (Visão IA)"])
+# CRIA 3 ABAS AGORA
+aba1, aba2, aba3 = st.tabs(["🏋️‍♂️ Treino", "💰 Contador", "🔧 Diagnóstico"])
 
 with aba1:
     f = st.file_uploader("CSV Profit", type=["csv"])
@@ -140,42 +130,43 @@ with aba1:
                 c1.metric("Resultado", f"R$ {res:,.2f}")
                 c2.metric("Trades", trd)
                 if st.button("Coach"):
-                    n = obter_modelo_disponivel()
                     try:
-                        msg = genai.GenerativeModel(n).generate_content(f"Trader: R$ {res:.2f}, {trd} trades. Feedback.").text
+                        # Tenta modelo padrão para texto
+                        model = genai.GenerativeModel('gemini-1.5-flash')
+                        msg = model.generate_content(f"Trader: R$ {res:.2f}, {trd} trades. Feedback.").text
                         st.info(msg)
                     except:
-                        st.error("Erro ao chamar Coach.")
+                        st.error("Erro no Coach. Tente a aba Diagnóstico.")
                 st.dataframe(df)
 
 with aba2:
-    st.header("Leitor Fiscal (Modo Visão)")
-    st.info("A IA vai ler o PDF visualmente.")
+    st.header("Leitor Fiscal (Auto-Repair)")
+    st.caption("O sistema tentará 5 modelos diferentes até conseguir ler sua nota.")
     
     c1,c2 = st.columns(2)
-    pdf = c1.file_uploader("Nota PDF", type=["pdf"], key="pdf_vision")
+    pdf = c1.file_uploader("Nota PDF", type=["pdf"], key="pdf_brute")
     prej = c2.number_input("Prejuízo Anterior", 0.0, step=10.0)
     
     if pdf:
-        with st.spinner("Auditando documento..."):
-            dados = analisar_pdf_visao(pdf)
+        with st.spinner("Testando modelos de IA..."):
+            dados = analisar_pdf_com_tentativas(pdf)
         
         if "erro" in dados:
-            st.error(f"Erro: {dados['erro']}")
+            st.error(f"❌ Falha Total: {dados['erro']}")
+            st.info("Vá na aba '🔧 Diagnóstico' para ver o que está acontecendo.")
         else:
             liq = converter_para_float(dados.get('resultado_liquido_nota', 0))
             custos = converter_para_float(dados.get('total_custos', 0))
             irrf = converter_para_float(dados.get('irrf', 0))
             data = dados.get('data_pregao', '-')
             raciocinio = dados.get('raciocinio', '-')
-            modelo_usado = dados.get('modelo_debug', 'Desconhecido')
+            modelo_ok = dados.get('modelo_sucesso', 'Desconhecido')
             
-            st.success(f"Nota de {data}")
-            st.caption(f"Modelo usado: {modelo_usado}")
-            st.info(f"👀 **Análise:** {raciocinio}")
+            st.success(f"✅ Nota Lida com Sucesso! (Usando: {modelo_ok})")
+            st.info(f"🧠 **Raciocínio:** {raciocinio}")
             
-            # Correção Manual
-            with st.expander("📝 Ajuste Manual (Se necessário)"):
+            # Edição
+            with st.expander("📝 Ajuste Manual"):
                 col_m1, col_m2, col_m3 = st.columns(3)
                 liq = col_m1.number_input("Líquido", value=liq, step=1.0)
                 custos = col_m2.number_input("Custos", value=custos, step=0.1)
@@ -198,3 +189,21 @@ with aba2:
                 else: st.success("Isento")
             else:
                 st.error(f"Prejuízo a Acumular: R$ {abs(base_calculo):,.2f}")
+
+with aba3:
+    st.header("🔧 Diagnóstico de API")
+    if st.button("Listar Modelos Disponíveis"):
+        try:
+            st.write("Consultando Google API...")
+            modelos = []
+            for m in genai.list_models():
+                modelos.append(f"Nome: `{m.name}` | Métodos: {m.supported_generation_methods}")
+            
+            if modelos:
+                st.success(f"Encontrados {len(modelos)} modelos disponíveis para sua chave:")
+                for mod in modelos:
+                    st.markdown(mod)
+            else:
+                st.warning("A API respondeu, mas a lista de modelos veio vazia.")
+        except Exception as e:
+            st.error(f"Erro ao conectar na API: {e}")
